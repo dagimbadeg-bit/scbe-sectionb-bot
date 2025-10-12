@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Get token from environment variable for security
-TOKEN = os.environ.get("TOKEN")
+TOKEN = os.environ.get("7927494300:AAGie3-OytbDajmuw7ZcPhZqLNmoKvvpHy8")
 if not TOKEN:
     raise ValueError("Bot token not found. Set it in environment variables as TOKEN.")
 
