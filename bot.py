@@ -1,32 +1,42 @@
 import os
 import asyncio
+import threading
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Get token from environment variable for security
+# --- Flask setup (for Render keep-alive) ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "✅ SCBE Section B Bot is alive!"
+
+def run_flask():
+    web_app.run(host="0.0.0.0", port=8080)
+
+# Run Flask in a background thread
+threading.Thread(target=run_flask).start()
+
+# --- Telegram bot setup ---
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("Bot token not found. Set it in environment variables as TOKEN.")
 
-# Command: /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I’m the SCBE Section B bot 👋\nI welcome newcomers. Type /help for commands."
     )
 
-# Command: /help
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start - say hi\n/help - show commands")
 
-# Welcome new members
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Try to delete Telegram's default join message
     try:
         await update.message.delete()
     except Exception as e:
         print(f"Failed to delete join message: {e}")
 
-    # Send custom welcome messages
     if update.message.new_chat_members:
         for member in update.message.new_chat_members:
             name_to_use = member.username or member.full_name
@@ -38,33 +48,27 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "Feel free to introduce yourself! 😄"
                 )
             )
-            # Auto-delete welcome message after 60 seconds
             await asyncio.sleep(60)
             try:
                 await msg.delete()
             except Exception as e:
                 print(f"Failed to delete welcome message: {e}")
 
-# Detect member leaving
 async def member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.delete()
     except Exception as e:
         print(f"Failed to delete left message: {e}")
 
-# Main bot setup
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-
-    # Welcome and left messages
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, member_left))
 
-    print("Bot running...")
+    print("🚀 Bot is now running on Render...")
     app.run_polling()
 
 if __name__ == "__main__":
