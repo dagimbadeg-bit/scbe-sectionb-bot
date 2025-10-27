@@ -104,7 +104,7 @@ async def verify_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"👋 Welcome {member.full_name}!\nPlease reply with your **student ID** within 10 minutes to stay in the group."
+            text=f"👋 Welcome {member.full_name}!\nPlease reply with your student ID within 10 minutes to stay in the group."
         )
 
         try:
