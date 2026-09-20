@@ -614,11 +614,10 @@ async def receive_student_id(
         conn.close()
 
         await update.message.reply_text(
-            "🧪 *TEST VOTE RECORDED*\n\n"
+            "✅ *VOTE SUCCESSFULLY RECORDED*\n\n"
             f"Candidate: *{candidate_name(candidate_id)}*\n"
-            f"Test voter: `{student_id}`\n"
-            f"Valid votes from this test account: *{total}*\n\n"
-            "This vote has been counted.",
+            f"Student ID: `{student_id}`\n"
+            "Your vote has been counted.",
             parse_mode="Markdown",
         )
 
