@@ -1,7 +1,9 @@
 import os
-import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,39 +17,49 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TOKEN:
-    raise ValueError("TOKEN is missing from Render Environment Variables.")
+    raise RuntimeError("TOKEN environment variable is missing.")
 
-DB_FILE = "election.db"
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is missing.")
+
 
 ELECTION_DURATION_MINUTES = 60
 
-# Special simulation/test voter
+# Special simulation/test voter.
+# This account may cast multiple VALID votes.
 SPECIAL_TEST_STUDENT_ID = "UGR/6094/17"
 
-# ------------------------------------------------------------
-# ADMIN TELEGRAM IDS
-#
-# Render environment variable:
-#
-# ADMIN_IDS=123456789,987654321
-# ------------------------------------------------------------
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+# ============================================================
+# ADMIN IDS
+# ============================================================
 
-# ------------------------------------------------------------
+ADMIN_IDS = set()
+
+admin_ids_raw = os.getenv("ADMIN_IDS", "")
+
+for value in admin_ids_raw.split(","):
+    value = value.strip()
+
+    if value:
+        try:
+            ADMIN_IDS.add(int(value))
+        except ValueError:
+            pass
+
+
+# ============================================================
 # CANDIDATES
-# ------------------------------------------------------------
+# ============================================================
 
 CANDIDATES = {
     1: "Biruktawit Zelalem",
@@ -55,27 +67,24 @@ CANDIDATES = {
     3: "Dagim Badeg",
 }
 
-# Optional candidate Telegram IDs.
-#
-# Example Render variables:
-#
-# CANDIDATE_1_ID=123456789
-# CANDIDATE_2_ID=987654321
-# CANDIDATE_3_ID=555555555
-#
-# We can configure these later.
 
+# Optional candidate Telegram IDs.
+# Set these in Render if candidates should be able to use /myscore.
 CANDIDATE_TELEGRAM_IDS = {}
 
-for candidate_number in CANDIDATES:
-    value = os.getenv(f"CANDIDATE_{candidate_number}_ID")
+for candidate_id in CANDIDATES:
+    env_name = f"CANDIDATE_{candidate_id}_ID"
+    value = os.getenv(env_name)
 
-    if value and value.isdigit():
-        CANDIDATE_TELEGRAM_IDS[candidate_number] = int(value)
+    if value:
+        try:
+            CANDIDATE_TELEGRAM_IDS[candidate_id] = int(value)
+        except ValueError:
+            pass
 
 
 # ============================================================
-# ELIGIBLE VOTERS
+# ELIGIBLE SECTION B VOTERS
 # ============================================================
 
 VOTER_DATA = """
@@ -143,15 +152,16 @@ UGR/8278/17|Yosef Amdneh Ebsa
 UGR/0393/17|Zekariyas Niguse Teka
 """
 
+
 ELIGIBLE_VOTERS = {}
 
 for line in VOTER_DATA.strip().splitlines():
     student_id, name = line.split("|", 1)
-    ELIGIBLE_VOTERS[student_id.strip().upper()] = name.strip()
+    ELIGIBLE_VOTERS[student_id.strip()] = name.strip()
 
 
 # ============================================================
-# FLASK
+# FLASK KEEP-ALIVE SERVER
 # ============================================================
 
 web_app = Flask(__name__)
@@ -162,11 +172,20 @@ def home():
     return "Section B Election Bot is alive."
 
 
-def run_flask():
-    web_app.run(host="0.0.0.0", port=8080)
+@web_app.route("/health")
+def health():
+    return "OK"
 
 
-threading.Thread(target=run_flask, daemon=True).start()
+def run_web_server():
+    port = int(os.getenv("PORT", 8080))
+
+    web_app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+    )
 
 
 # ============================================================
@@ -174,674 +193,989 @@ threading.Thread(target=run_flask, daemon=True).start()
 # ============================================================
 
 def db():
-    connection = sqlite3.connect(DB_FILE)
-    connection.row_factory = sqlite3.Row
-    return connection
+    """
+    Create a PostgreSQL connection to Supabase.
+    """
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        connect_timeout=15,
+    )
 
 
 def init_database():
-    conn = db()
+    """
+    Prepare the existing Supabase database.
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS election (
-            id INTEGER PRIMARY KEY CHECK(id = 1),
-            started_at TEXT,
-            ends_at TEXT,
-            active INTEGER NOT NULL DEFAULT 0
+    Tables are already created in Supabase SQL Editor.
+    This function only ensures that:
+      1. election row exists
+      2. all 62 eligible voters exist
+    """
+
+    connection = db()
+
+    try:
+        cursor = connection.cursor()
+
+        # Make sure election row exists.
+        cursor.execute(
+            """
+            INSERT INTO election (id, active)
+            VALUES (1, FALSE)
+            ON CONFLICT (id) DO NOTHING
+            """
         )
-    """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS voters (
-            student_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            telegram_id INTEGER,
-            has_voted INTEGER NOT NULL DEFAULT 0
+        # Insert eligible voters.
+        for student_id, name in ELIGIBLE_VOTERS.items():
+            cursor.execute(
+                """
+                INSERT INTO voters
+                    (student_id, name, telegram_id, has_voted)
+                VALUES
+                    (%s, %s, NULL, FALSE)
+                ON CONFLICT (student_id) DO NOTHING
+                """,
+                (student_id, name),
+            )
+
+        connection.commit()
+
+        print(
+            f"Database initialized successfully. "
+            f"{len(ELIGIBLE_VOTERS)} eligible voters loaded."
         )
-    """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id TEXT NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            candidate_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+    except Exception:
+        connection.rollback()
+        raise
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id TEXT,
-            telegram_id INTEGER,
-            candidate_id INTEGER,
-            status TEXT NOT NULL,
-            reason TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        INSERT OR IGNORE INTO election(id, active)
-        VALUES(1, 0)
-    """)
-
-    for student_id, name in ELIGIBLE_VOTERS.items():
-        conn.execute("""
-            INSERT OR IGNORE INTO voters(student_id, name)
-            VALUES(?, ?)
-        """, (student_id, name))
-
-    conn.commit()
-    conn.close()
+    finally:
+        connection.close()
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def now_utc():
     return datetime.now(timezone.utc)
 
 
-def normalize_id(value):
-    return value.strip().upper()
+def normalize_id(student_id):
+    """
+    Normalize student IDs so that:
+    ugr/5340/17
+    UGR/5340/17
+    UGR / 5340 / 17
+
+    all become:
+
+    UGR/5340/17
+    """
+
+    if not student_id:
+        return ""
+
+    student_id = student_id.strip().upper()
+
+    student_id = student_id.replace(" ", "")
+
+    return student_id
 
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+def candidate_name(candidate_id):
+    return CANDIDATES.get(candidate_id, "Unknown candidate")
+
+
 def election_active():
-    conn = db()
+    connection = db()
 
-    row = conn.execute("""
-        SELECT active, ends_at
-        FROM election
-        WHERE id = 1
-    """).fetchone()
+    try:
+        cursor = connection.cursor()
 
-    conn.close()
+        cursor.execute(
+            """
+            SELECT active, ends_at
+            FROM election
+            WHERE id = 1
+            """
+        )
 
-    if not row or row["active"] != 1 or not row["ends_at"]:
-        return False
+        row = cursor.fetchone()
 
-    end_time = datetime.fromisoformat(row["ends_at"])
+        if not row:
+            return False
 
-    return now_utc() < end_time
+        if not row["active"]:
+            return False
 
+        ends_at = row["ends_at"]
+
+        if ends_at and now_utc() >= ends_at:
+            cursor.execute(
+                """
+                UPDATE election
+                SET active = FALSE
+                WHERE id = 1
+                """
+            )
+
+            connection.commit()
+
+            return False
+
+        return True
+
+    finally:
+        connection.close()
+
+
+def get_election():
+    connection = db()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM election
+            WHERE id = 1
+            """
+        )
+
+        return cursor.fetchone()
+
+    finally:
+        connection.close()
+
+
+def get_candidate_votes(candidate_id):
+    connection = db()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM votes
+            WHERE candidate_id = %s
+            """,
+            (candidate_id,),
+        )
+
+        row = cursor.fetchone()
+
+        return row["count"] if row else 0
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# ELECTION CONTROL
+# ============================================================
 
 def start_election():
-    start = now_utc()
-    end = start + timedelta(minutes=ELECTION_DURATION_MINUTES)
+    connection = db()
 
-    conn = db()
+    try:
+        cursor = connection.cursor()
 
-    conn.execute("""
-        UPDATE election
-        SET started_at = ?,
-            ends_at = ?,
-            active = 1
-        WHERE id = 1
-    """, (
-        start.isoformat(),
-        end.isoformat(),
-    ))
+        started_at = now_utc()
+        ends_at = started_at + timedelta(
+            minutes=ELECTION_DURATION_MINUTES
+        )
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            UPDATE election
+            SET
+                started_at = %s,
+                ends_at = %s,
+                active = TRUE
+            WHERE id = 1
+            """,
+            (started_at, ends_at),
+        )
 
-    return start, end
+        connection.commit()
+
+        return started_at, ends_at
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
 
 
 def close_election():
-    conn = db()
+    connection = db()
 
-    conn.execute("""
-        UPDATE election
-        SET active = 0
-        WHERE id = 1
-    """)
+    try:
+        cursor = connection.cursor()
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            UPDATE election
+            SET active = FALSE
+            WHERE id = 1
+            """
+        )
 
+        connection.commit()
 
-def candidate_name(candidate_id):
-    return CANDIDATES.get(candidate_id, "Unknown")
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
 
 
 # ============================================================
-# /START
+# START / RULES / CANDIDATES
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-
     keyboard = [
-        [InlineKeyboardButton(
-            "📜 Rules & Regulations",
-            callback_data="rules"
-        )],
-        [InlineKeyboardButton(
-            "👥 Candidate List",
-            callback_data="candidates"
-        )],
-        [InlineKeyboardButton(
-            "🗳️ Vote Now",
-            callback_data="vote"
-        )],
+        [
+            InlineKeyboardButton(
+                "📜 Rules & Regulations",
+                callback_data="rules",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Candidate List",
+                callback_data="candidates",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗳️ Vote",
+                callback_data="vote",
+            )
+        ],
     ]
 
     await update.message.reply_text(
-        "🗳️ *SECTION B ELECTION*\n\n"
-        "Welcome to the election system.\n\n"
-        "Please review the rules before voting.",
-        parse_mode="Markdown",
+        "🗳️ *Section B Simulated Election*\n\n"
+        "Welcome to the Section B election simulation system.\n\n"
+        "Please review the rules and candidates before voting.",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
 
-# ============================================================
-# RULES
-# ============================================================
-
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_rules(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
+    text = (
+        "📜 *RULES & REGULATIONS*\n\n"
+        "1. Only registered Section B students may vote.\n\n"
+        "2. Each normal voter may cast one valid vote.\n\n"
+        "3. Your Student ID must match the registered voter list.\n\n"
+        "4. Invalid Student IDs do not create votes.\n\n"
+        "5. A normal voter who has already voted cannot vote again.\n\n"
+        "6. The election lasts for 60 minutes after it is started.\n\n"
+        "7. The candidate with the highest number of valid votes "
+        "has the highest vote count.\n\n"
+        "8. This is a simulated/laboratory election system."
+    )
+
     keyboard = [
-        [InlineKeyboardButton(
-            "👥 Candidate List",
-            callback_data="candidates"
-        )],
-        [InlineKeyboardButton(
-            "🗳️ Vote Now",
-            callback_data="vote"
-        )],
+        [
+            InlineKeyboardButton(
+                "👥 Candidate List",
+                callback_data="candidates",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗳️ Vote",
+                callback_data="vote",
+            )
+        ],
     ]
 
     await query.edit_message_text(
-        "📜 *RULES & REGULATIONS*\n\n"
-        "• The election is open for 60 minutes.\n"
-        "• Only registered Section B voters are eligible.\n"
-        "• Normal voters may cast one vote.\n"
-        "• You first select a candidate.\n"
-        "• Your selection is NOT counted immediately.\n"
-        "• You must provide a valid Student ID.\n"
-        "• The vote is counted only after successful validation.\n"
-        "• Invalid Student IDs do not produce votes.\n"
-        "• Attempts to vote again after voting are logged.\n"
-        "• The candidate with the highest valid vote count wins.\n\n"
-        "🧪 A designated simulation test account has special "
-        "repeat-voting permission for testing.",
-        parse_mode="Markdown",
+        text,
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
 
-# ============================================================
-# CANDIDATES
-# ============================================================
-
-async def candidates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_candidates(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
     text = "👥 *CANDIDATES*\n\n"
 
-    for number, name in CANDIDATES.items():
-        text += f"{number}. {name}\n"
+    for candidate_id, name in CANDIDATES.items():
+        text += f"{candidate_id}. {name}\n"
 
     keyboard = [
-        [InlineKeyboardButton(
-            "🗳️ Vote Now",
-            callback_data="vote"
-        )],
-        [InlineKeyboardButton(
-            "📜 Rules",
-            callback_data="rules"
-        )],
+        [
+            InlineKeyboardButton(
+                "🗳️ Vote Now",
+                callback_data="vote",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📜 Rules",
+                callback_data="rules",
+            )
+        ],
     ]
 
     await query.edit_message_text(
         text,
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
 
 # ============================================================
-# VOTE START
+# VOTING FLOW
 # ============================================================
 
-async def vote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+SELECT_CANDIDATE, ENTER_STUDENT_ID = range(2)
+
+
+async def start_vote(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
 
     if not election_active():
         await query.edit_message_text(
             "🔴 *Voting is currently closed.*\n\n"
-            "Please wait until the administrator opens the election.",
+            "Please wait until the election is opened.",
             parse_mode="Markdown",
         )
+
         return ConversationHandler.END
 
     keyboard = []
 
-    for number, name in CANDIDATES.items():
-        keyboard.append([
+    for candidate_id, name in CANDIDATES.items():
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    name,
+                    callback_data=f"candidate_{candidate_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
             InlineKeyboardButton(
-                name,
-                callback_data=f"candidate:{number}"
+                "❌ Cancel",
+                callback_data="cancel_vote",
             )
-        ])
+        ]
+    )
 
     await query.edit_message_text(
         "🗳️ *SELECT YOUR CANDIDATE*\n\n"
-        "Select one candidate.\n\n"
-        "⚠️ Your vote will NOT be counted yet.\n"
-        "You will be asked for your Student ID next.",
-        parse_mode="Markdown",
+        "Choose the candidate you want to vote for.",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
-    return SELECTING_CANDIDATE
+    return SELECT_CANDIDATE
 
 
-# ============================================================
-# CANDIDATE SELECTED
-# ============================================================
-
-async def candidate_selected(
+async def select_candidate(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
     await query.answer()
 
-    if not election_active():
-        await query.edit_message_text("🔴 Voting is closed.")
+    if query.data == "cancel_vote":
+        await query.edit_message_text(
+            "❌ Voting cancelled."
+        )
+
         return ConversationHandler.END
 
-    candidate_id = int(query.data.split(":")[1])
+    try:
+        candidate_id = int(
+            query.data.replace("candidate_", "")
+        )
+    except ValueError:
+        await query.edit_message_text(
+            "❌ Invalid candidate selection."
+        )
+
+        return ConversationHandler.END
 
     if candidate_id not in CANDIDATES:
-        await query.edit_message_text("❌ Invalid candidate.")
+        await query.edit_message_text(
+            "❌ Invalid candidate."
+        )
+
         return ConversationHandler.END
 
-    # IMPORTANT:
-    # Nothing is counted here.
     context.user_data["pending_candidate"] = candidate_id
 
     await query.edit_message_text(
-        f"✅ Selected: *{candidate_name(candidate_id)}*\n\n"
-        "🪪 Please enter your Student ID.\n\n"
+        "🪪 *ENTER YOUR STUDENT ID*\n\n"
+        "Please enter your registered Section B Student ID.\n\n"
         "Example:\n"
-        "`UGR/6881/17`\n\n"
-        "Your vote will be counted only after your ID "
-        "is successfully validated.",
+        "`UGR/5340/17`",
         parse_mode="Markdown",
     )
 
-    return WAITING_FOR_ID
+    return ENTER_STUDENT_ID
 
-
-# ============================================================
-# STUDENT ID
-# ============================================================
 
 async def receive_student_id(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     if not election_active():
         await update.message.reply_text(
-            "🔴 The election has closed."
+            "🔴 Voting has closed."
         )
-        context.user_data.clear()
+
+        context.user_data.pop("pending_candidate", None)
+
         return ConversationHandler.END
 
-    candidate_id = context.user_data.get("pending_candidate")
+    candidate_id = context.user_data.get(
+        "pending_candidate"
+    )
 
     if candidate_id not in CANDIDATES:
         await update.message.reply_text(
-            "❌ No pending candidate selection.\n"
-            "Please use /start and begin again."
+            "❌ Your voting session expired. "
+            "Please press /start and try again."
         )
-        context.user_data.clear()
+
         return ConversationHandler.END
+
+    raw_student_id = update.message.text
+    student_id = normalize_id(raw_student_id)
 
     telegram_id = update.effective_user.id
-    student_id = normalize_id(update.message.text)
-    timestamp = now_utc().isoformat()
 
-    conn = db()
+    connection = db()
 
-    # --------------------------------------------------------
-    # 1. VALIDATE STUDENT ID
-    # --------------------------------------------------------
+    try:
+        cursor = connection.cursor()
 
-    voter = conn.execute("""
-        SELECT *
-        FROM voters
-        WHERE student_id = ?
-    """, (student_id,)).fetchone()
+        # ----------------------------------------------------
+        # Check whether Student ID exists.
+        # ----------------------------------------------------
 
-    if not voter:
-
-        conn.execute("""
-            INSERT INTO attempts(
-                student_id,
-                telegram_id,
-                candidate_id,
-                status,
-                reason,
-                created_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?)
-        """, (
-            student_id,
-            telegram_id,
-            candidate_id,
-            "REJECTED",
-            "Invalid Student ID",
-            timestamp,
-        ))
-
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(
-            "❌ *INVALID STUDENT ID*\n\n"
-            "Your vote was NOT counted.\n"
-            "The attempt has been logged.",
-            parse_mode="Markdown",
+        cursor.execute(
+            """
+            SELECT student_id, name, telegram_id, has_voted
+            FROM voters
+            WHERE student_id = %s
+            """,
+            (student_id,),
         )
 
-        context.user_data.clear()
-        return ConversationHandler.END
+        voter = cursor.fetchone()
 
-    # --------------------------------------------------------
-    # 2. SPECIAL TEST VOTER
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # INVALID STUDENT ID
+        # ----------------------------------------------------
 
-    if student_id == SPECIAL_TEST_STUDENT_ID:
+        if not voter:
+            cursor.execute(
+                """
+                INSERT INTO attempts
+                    (
+                        student_id,
+                        telegram_id,
+                        candidate_id,
+                        status,
+                        reason,
+                        created_at
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    "REJECTED",
+                    "Invalid Student ID",
+                    now_utc(),
+                ),
+            )
 
-        conn.execute("""
-            INSERT INTO votes(
+            connection.commit()
+
+            await update.message.reply_text(
+                "❌ *INVALID STUDENT ID*\n\n"
+                "No vote was recorded.\n\n"
+                "Please check your Student ID and try again.",
+                parse_mode="Markdown",
+            )
+
+            return ConversationHandler.END
+
+        # ----------------------------------------------------
+        # SPECIAL SIMULATION/TEST VOTER
+        # ----------------------------------------------------
+
+        if student_id == SPECIAL_TEST_STUDENT_ID:
+
+            # Record Telegram account associated with the test ID.
+            cursor.execute(
+                """
+                UPDATE voters
+                SET telegram_id = %s
+                WHERE student_id = %s
+                """,
+                (
+                    telegram_id,
+                    student_id,
+                ),
+            )
+
+            # Record the actual valid vote.
+            cursor.execute(
+                """
+                INSERT INTO votes
+                    (
+                        student_id,
+                        telegram_id,
+                        candidate_id,
+                        created_at
+                    )
+                VALUES
+                    (%s, %s, %s, %s)
+                """,
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    now_utc(),
+                ),
+            )
+
+            # Record successful attempt.
+            cursor.execute(
+                """
+                INSERT INTO attempts
+                    (
+                        student_id,
+                        telegram_id,
+                        candidate_id,
+                        status,
+                        reason,
+                        created_at
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    "VALID_TEST_VOTE",
+                    "Special simulation/test account",
+                    now_utc(),
+                ),
+            )
+
+            # Count how many valid votes this special account has.
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM votes
+                WHERE student_id = %s
+                """,
+                (student_id,),
+            )
+
+            total = cursor.fetchone()["count"]
+
+            connection.commit()
+
+            context.user_data.pop("pending_candidate", None)
+
+            await update.message.reply_text(
+                "✅ *VOTE SUCCESSFULLY RECORDED*\n\n"
+                f"Candidate: *{candidate_name(candidate_id)}*\n"
+                f"Student ID: `{student_id}`\n"
+                "Your vote has been counted.",
+                parse_mode="Markdown",
+            )
+
+            return ConversationHandler.END
+
+        # ----------------------------------------------------
+        # NORMAL VOTER ALREADY VOTED
+        # ----------------------------------------------------
+
+        if voter["has_voted"]:
+            cursor.execute(
+                """
+                INSERT INTO attempts
+                    (
+                        student_id,
+                        telegram_id,
+                        candidate_id,
+                        status,
+                        reason,
+                        created_at
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    "REJECTED",
+                    "Voter has already voted",
+                    now_utc(),
+                ),
+            )
+
+            # Count attempts for this Student ID.
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM attempts
+                WHERE student_id = %s
+                """,
+                (student_id,),
+            )
+
+            attempts_count = cursor.fetchone()["count"]
+
+            connection.commit()
+
+            if attempts_count > 1:
+                await update.message.reply_text(
+                    "⚠️ *VOTE NOT RECORDED*\n\n"
+                    "This Student ID has already been used to cast "
+                    "a valid vote.\n\n"
+                    f"Attempt number: *{attempts_count}*\n"
+                    "No additional vote was counted.",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ *VOTE NOT RECORDED*\n\n"
+                    "This Student ID has already voted.\n\n"
+                    "Only one valid vote is allowed for a normal voter.",
+                    parse_mode="Markdown",
+                )
+
+            return ConversationHandler.END
+
+        # ----------------------------------------------------
+        # NORMAL VALID VOTE
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            INSERT INTO votes
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    created_at
+                )
+            VALUES
+                (%s, %s, %s, %s)
+            """,
+            (
                 student_id,
                 telegram_id,
                 candidate_id,
-                created_at
-            )
-            VALUES(?, ?, ?, ?)
-        """, (
-            student_id,
-            telegram_id,
-            candidate_id,
-            timestamp,
-        ))
+                now_utc(),
+            ),
+        )
 
-        conn.execute("""
-            INSERT INTO attempts(
+        # Mark voter as having voted.
+        cursor.execute(
+            """
+            UPDATE voters
+            SET
+                has_voted = TRUE,
+                telegram_id = %s
+            WHERE student_id = %s
+            """,
+            (
+                telegram_id,
+                student_id,
+            ),
+        )
+
+        # Log successful vote.
+        cursor.execute(
+            """
+            INSERT INTO attempts
+                (
+                    student_id,
+                    telegram_id,
+                    candidate_id,
+                    status,
+                    reason,
+                    created_at
+                )
+            VALUES
+                (%s, %s, %s, %s, %s, %s)
+            """,
+            (
                 student_id,
                 telegram_id,
                 candidate_id,
-                status,
-                reason,
-                created_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?)
-        """, (
-            student_id,
-            telegram_id,
-            candidate_id,
-            "VALID_TEST_VOTE",
-            "Simulation test voter",
-            timestamp,
-        ))
+                "VALID_VOTE",
+                "Valid voter",
+                now_utc(),
+            ),
+        )
 
-        conn.commit()
+        connection.commit()
 
-        total = conn.execute("""
-            SELECT COUNT(*)
-            FROM votes
-            WHERE student_id = ?
-        """, (student_id,)).fetchone()[0]
-
-        conn.close()
+        context.user_data.pop("pending_candidate", None)
 
         await update.message.reply_text(
             "✅ *VOTE SUCCESSFULLY RECORDED*\n\n"
             f"Candidate: *{candidate_name(candidate_id)}*\n"
-            f"Student ID: `{student_id}`\n"
+            f"Student ID: `{student_id}`\n\n"
             "Your vote has been counted.",
             parse_mode="Markdown",
         )
 
-        context.user_data.clear()
         return ConversationHandler.END
 
-    # --------------------------------------------------------
-    # 3. NORMAL VOTER — ALREADY VOTED?
-    # --------------------------------------------------------
+    except Exception as error:
+        connection.rollback()
 
-    if voter["has_voted"] == 1:
-
-        conn.execute("""
-            INSERT INTO attempts(
-                student_id,
-                telegram_id,
-                candidate_id,
-                status,
-                reason,
-                created_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?)
-        """, (
-            student_id,
-            telegram_id,
-            candidate_id,
-            "REJECTED",
-            "Already voted",
-            timestamp,
-        ))
-
-        attempt_count = conn.execute("""
-            SELECT COUNT(*)
-            FROM attempts
-            WHERE student_id = ?
-        """, (student_id,)).fetchone()[0]
-
-        conn.commit()
-        conn.close()
-
-        warning = ""
-
-        if attempt_count > 1:
-            warning = (
-                "\n\n⚠️ Multiple voting attempts detected.\n"
-                f"Total attempts recorded: {attempt_count}"
-            )
+        print(
+            "Database error while processing vote:",
+            repr(error),
+        )
 
         await update.message.reply_text(
-            "⚠️ *VOTE NOT COUNTED*\n\n"
-            "This Student ID has already cast its vote."
-            + warning,
-            parse_mode="Markdown",
+            "⚠️ A database error occurred.\n\n"
+            "Your vote was not confirmed. "
+            "Please try again later."
         )
 
-        context.user_data.clear()
         return ConversationHandler.END
 
-    # --------------------------------------------------------
-    # 4. VALID VOTE
-    #
-    # ONLY HERE IS THE VOTE ACTUALLY COUNTED.
-    # --------------------------------------------------------
+    finally:
+        connection.close()
 
-    conn.execute("""
-        INSERT INTO votes(
-            student_id,
-            telegram_id,
-            candidate_id,
-            created_at
+
+async def cancel_vote(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop("pending_candidate", None)
+
+    if update.message:
+        await update.message.reply_text(
+            "❌ Voting cancelled."
         )
-        VALUES(?, ?, ?, ?)
-    """, (
-        student_id,
-        telegram_id,
-        candidate_id,
-        timestamp,
-    ))
 
-    conn.execute("""
-        UPDATE voters
-        SET telegram_id = ?,
-            has_voted = 1
-        WHERE student_id = ?
-    """, (
-        telegram_id,
-        student_id,
-    ))
+    elif update.callback_query:
+        await update.callback_query.answer()
 
-    conn.execute("""
-        INSERT INTO attempts(
-            student_id,
-            telegram_id,
-            candidate_id,
-            status,
-            reason,
-            created_at
+        await update.callback_query.edit_message_text(
+            "❌ Voting cancelled."
         )
-        VALUES(?, ?, ?, ?, ?, ?)
-    """, (
-        student_id,
-        telegram_id,
-        candidate_id,
-        "VALID_VOTE",
-        "Student ID validated successfully",
-        timestamp,
-    ))
 
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        "✅ *VOTE SUCCESSFULLY RECORDED*\n\n"
-        f"Candidate: *{candidate_name(candidate_id)}*\n"
-        f"Student ID: `{student_id}`\n\n"
-        "Your vote has been counted.",
-        parse_mode="Markdown",
-    )
-
-    context.user_data.clear()
     return ConversationHandler.END
 
 
 # ============================================================
-# ADMIN: START ELECTION
+# ADMIN COMMANDS
 # ============================================================
 
 async def start_election_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
         return
 
     if election_active():
         await update.message.reply_text(
-            "⚠️ The election is already running."
+            "⚠️ The election is already active."
         )
+
         return
 
-    start_time, end_time = start_election()
+    started_at, ends_at = start_election()
 
     await update.message.reply_text(
         "🟢 *ELECTION STARTED*\n\n"
-        "Duration: 60 minutes\n"
-        f"Started: `{start_time.strftime('%H:%M:%S UTC')}`\n"
-        f"Ends: `{end_time.strftime('%H:%M:%S UTC')}`\n\n"
-        "Voting is now open.",
+        f"Duration: *{ELECTION_DURATION_MINUTES} minutes*\n"
+        f"Started: `{started_at.isoformat()}`\n"
+        f"Ends: `{ends_at.isoformat()}`",
         parse_mode="Markdown",
     )
 
 
-# ============================================================
-# ADMIN: STOP ELECTION
-# ============================================================
-
 async def stop_election_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
         return
 
     close_election()
 
     await update.message.reply_text(
         "🔴 *ELECTION CLOSED*\n\n"
-        "No further votes can be recorded.",
+        "Voting is no longer active.",
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# ADMIN: RESULTS
+# RESULTS
 # ============================================================
 
-async def admin_results(
+async def results_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
         return
 
-    conn = db()
+    # Automatically close expired election.
+    active = election_active()
 
-    total_votes = conn.execute("""
-        SELECT COUNT(*)
-        FROM votes
-    """).fetchone()[0]
+    election = get_election()
 
-    voted_students = conn.execute("""
-        SELECT COUNT(*)
-        FROM voters
-        WHERE has_voted = 1
-    """).fetchone()[0]
+    connection = db()
 
-    results = []
+    try:
+        cursor = connection.cursor()
 
-    for candidate_id, name in CANDIDATES.items():
-        count = conn.execute("""
-            SELECT COUNT(*)
+        # Total eligible voters.
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM voters
+            """
+        )
+
+        eligible = cursor.fetchone()["count"]
+
+        # Normal voters marked as voted.
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM voters
+            WHERE has_voted = TRUE
+            """
+        )
+
+        marked_voted = cursor.fetchone()["count"]
+
+        # Total actual valid votes.
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS count
             FROM votes
-            WHERE candidate_id = ?
-        """, (candidate_id,)).fetchone()[0]
+            """
+        )
 
-        results.append((candidate_id, name, count))
+        total_votes = cursor.fetchone()["count"]
 
-    conn.close()
+        # Candidate results.
+        candidate_results = {}
 
-    status = "🟢 OPEN" if election_active() else "🔴 CLOSED"
+        for candidate_id in CANDIDATES:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM votes
+                WHERE candidate_id = %s
+                """,
+                (candidate_id,),
+            )
+
+            candidate_results[candidate_id] = cursor.fetchone()["count"]
+
+    finally:
+        connection.close()
+
+    status = "🟢 OPEN" if active else "🔴 CLOSED"
 
     text = (
         "📊 *ELECTION DASHBOARD*\n\n"
         f"Status: {status}\n"
-        f"Eligible voters: {len(ELIGIBLE_VOTERS)}\n"
-        f"Students marked voted: {voted_students}\n"
-        f"Total valid votes: {total_votes}\n\n"
+        f"Eligible voters: *{eligible}*\n"
+        f"Students marked voted: *{marked_voted}*\n"
+        f"Total valid votes: *{total_votes}*\n\n"
     )
 
-    for candidate_id, name, count in results:
-        text += f"*{candidate_id}. {name}* — {count}\n"
+    for candidate_id, name in CANDIDATES.items():
+        votes = candidate_results[candidate_id]
+
+        text += (
+            f"{candidate_id}. {name} — *{votes}*\n"
+        )
+
+    if election:
+        text += "\n"
+
+        if election["started_at"]:
+            text += (
+                f"Started: `{election['started_at'].isoformat()}`\n"
+            )
+
+        if election["ends_at"]:
+            text += (
+                f"Ends: `{election['ends_at'].isoformat()}`\n"
+            )
 
     await update.message.reply_text(
         text,
@@ -850,161 +1184,270 @@ async def admin_results(
 
 
 # ============================================================
-# ADMIN: NON-VOTERS
+# NON-VOTERS
 # ============================================================
 
-async def admin_nonvoters(
+async def nonvoters_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
         return
 
-    conn = db()
+    connection = db()
 
-    rows = conn.execute("""
-        SELECT student_id, name
-        FROM voters
-        WHERE has_voted = 0
-        ORDER BY student_id
-    """).fetchall()
+    try:
+        cursor = connection.cursor()
 
-    conn.close()
+        cursor.execute(
+            """
+            SELECT student_id, name
+            FROM voters
+            WHERE has_voted = FALSE
+            ORDER BY name
+            """
+        )
+
+        rows = cursor.fetchall()
+
+    finally:
+        connection.close()
 
     if not rows:
         await update.message.reply_text(
-            "✅ All registered voters have voted."
+            "✅ All normal voters have voted."
         )
+
         return
 
     text = (
-        f"👥 *NON-VOTERS*\n\n"
-        f"Remaining: {len(rows)}\n\n"
+        f"👤 *NON-VOTERS*\n\n"
+        f"Remaining: *{len(rows)}*\n\n"
     )
 
-    for index, row in enumerate(rows, 1):
-        text += f"{index}. `{row['student_id']}` — {row['name']}\n"
+    for index, row in enumerate(rows, start=1):
+        text += (
+            f"{index}. `{row['student_id']}` — "
+            f"{row['name']}\n"
+        )
 
-        # Telegram message size protection
-        if len(text) > 3500:
-            await update.message.reply_text(
-                text,
-                parse_mode="Markdown",
-            )
-            text = ""
-
-    if text:
+    # Telegram message length protection.
+    if len(text) <= 4000:
         await update.message.reply_text(
             text,
+            parse_mode="Markdown",
+        )
+        return
+
+    # Split long output.
+    chunk = ""
+
+    for line in text.splitlines(True):
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="Markdown",
+            )
+
+            chunk = ""
+
+        chunk += line
+
+    if chunk:
+        await update.message.reply_text(
+            chunk,
             parse_mode="Markdown",
         )
 
 
 # ============================================================
-# ADMIN: MULTIPLE ATTEMPTS
+# ATTEMPTS
 # ============================================================
 
-async def admin_attempts(
+async def attempts_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
         return
 
-    conn = db()
+    connection = db()
 
-    rows = conn.execute("""
-        SELECT
-            student_id,
-            COUNT(*) AS attempts
-        FROM attempts
-        GROUP BY student_id
-        HAVING COUNT(*) > 1
-        ORDER BY attempts DESC
-    """).fetchall()
+    try:
+        cursor = connection.cursor()
 
-    conn.close()
+        cursor.execute(
+            """
+            SELECT
+                student_id,
+                telegram_id,
+                candidate_id,
+                status,
+                reason,
+                created_at
+            FROM attempts
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        )
+
+        rows = cursor.fetchall()
+
+    finally:
+        connection.close()
 
     if not rows:
         await update.message.reply_text(
-            "✅ No repeated voting attempts detected."
+            "📭 No voting attempts recorded."
         )
+
         return
 
-    text = "⚠️ *MULTIPLE VOTING ATTEMPTS*\n\n"
+    text = "📝 *RECENT VOTING ATTEMPTS*\n\n"
 
     for row in rows:
-        text += (
-            f"`{row['student_id']}` — "
-            f"{row['attempts']} attempts\n"
+        candidate = (
+            candidate_name(row["candidate_id"])
+            if row["candidate_id"] in CANDIDATES
+            else "N/A"
         )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# ADMIN: FULL ATTEMPT LOG
-# ============================================================
-
-async def admin_logs(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin access only.")
-        return
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT
-            student_id,
-            candidate_id,
-            status,
-            reason,
-            created_at
-        FROM attempts
-        ORDER BY id DESC
-        LIMIT 30
-    """).fetchall()
-
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "No voting attempts recorded yet."
-        )
-        return
-
-    text = "🧾 *RECENT VOTING ATTEMPTS*\n\n"
-
-    for row in rows:
-        candidate = candidate_name(row["candidate_id"])
-
         text += (
-            f"`{row['student_id']}`\n"
+            f"ID: `{row['student_id'] or 'N/A'}`\n"
             f"Candidate: {candidate}\n"
-            f"Status: {row['status']}\n"
-            f"Reason: {row['reason']}\n"
-            f"Time: {row['created_at']}\n\n"
+            f"Status: *{row['status']}*\n"
+            f"Reason: {row['reason'] or 'N/A'}\n"
+            f"Time: `{row['created_at']}`\n"
+            "──────────────\n"
         )
 
-        if len(text) > 3500:
-            await update.message.reply_text(
-                text,
-                parse_mode="Markdown"
-            )
-            text = ""
-
-    if text:
+    if len(text) <= 4000:
         await update.message.reply_text(
             text,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+        )
+        return
+
+    chunk = ""
+
+    for line in text.splitlines(True):
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="Markdown",
+            )
+
+            chunk = ""
+
+        chunk += line
+
+    if chunk:
+        await update.message.reply_text(
+            chunk,
+            parse_mode="Markdown",
+        )
+
+
+# ============================================================
+# LOGS
+# ============================================================
+
+async def logs_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ You are not authorized to use this command."
+        )
+
+        return
+
+    connection = db()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                student_id,
+                telegram_id,
+                candidate_id,
+                created_at
+            FROM votes
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        )
+
+        rows = cursor.fetchall()
+
+    finally:
+        connection.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "📭 No valid votes recorded."
+        )
+
+        return
+
+    text = "🗳️ *VALID VOTE LOG*\n\n"
+
+    for row in rows:
+        candidate = candidate_name(
+            row["candidate_id"]
+        )
+
+        text += (
+            f"Vote #{row['id']}\n"
+            f"Student ID: `{row['student_id']}`\n"
+            f"Telegram ID: `{row['telegram_id']}`\n"
+            f"Candidate: *{candidate}*\n"
+            f"Time: `{row['created_at']}`\n"
+            "──────────────\n"
+        )
+
+    if len(text) <= 4000:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+        )
+        return
+
+    chunk = ""
+
+    for line in text.splitlines(True):
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="Markdown",
+            )
+
+            chunk = ""
+
+        chunk += line
+
+    if chunk:
+        await update.message.reply_text(
+            chunk,
+            parse_mode="Markdown",
         )
 
 
@@ -1012,54 +1455,87 @@ async def admin_logs(
 # CANDIDATE SCORE
 # ============================================================
 
-async def my_score(
+async def myscore_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     telegram_id = update.effective_user.id
 
     candidate_id = None
 
-    for number, candidate_telegram_id in CANDIDATE_TELEGRAM_IDS.items():
+    for cid, candidate_telegram_id in CANDIDATE_TELEGRAM_IDS.items():
         if telegram_id == candidate_telegram_id:
-            candidate_id = number
+            candidate_id = cid
             break
 
     if candidate_id is None:
         await update.message.reply_text(
-            "⛔ Candidate access is not configured for your account."
+            "⛔ This Telegram account is not registered "
+            "as a candidate account."
         )
+
         return
 
-    conn = db()
-
-    count = conn.execute("""
-        SELECT COUNT(*)
-        FROM votes
-        WHERE candidate_id = ?
-    """, (candidate_id,)).fetchone()[0]
-
-    conn.close()
+    score = get_candidate_votes(candidate_id)
 
     await update.message.reply_text(
-        f"📊 *YOUR LIVE SCORE*\n\n"
+        "📊 *YOUR LIVE SCORE*\n\n"
         f"Candidate: *{candidate_name(candidate_id)}*\n"
-        f"Valid votes: *{count}*",
+        f"Valid votes: *{score}*",
+        parse_mode="Markdown",
+    )
+
+
+async def myid_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        f"Your Telegram ID is:\n`{update.effective_user.id}`",
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# USER ID
+# HELP
 # ============================================================
 
-async def my_id(
+async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
+    text = (
+        "ℹ️ *AVAILABLE COMMANDS*\n\n"
+        "/start — Open election menu\n"
+        "/help — Show help\n"
+        "/myid — Show your Telegram ID\n"
+        "/myscore — Candidate live score\n\n"
+        "Admin commands:\n"
+        "/start_election\n"
+        "/stop_election\n"
+        "/results\n"
+        "/nonvoters\n"
+        "/attempts\n"
+        "/logs"
+    )
+
     await update.message.reply_text(
-        f"Your Telegram user ID is:\n`{update.effective_user.id}`",
+        text,
         parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    print(
+        "Telegram error:",
+        repr(context.error),
     )
 
 
@@ -1067,13 +1543,25 @@ async def my_id(
 # MAIN
 # ============================================================
 
-SELECTING_CANDIDATE = 1
-WAITING_FOR_ID = 2
-
-
 def main():
 
+    print("Initializing Supabase PostgreSQL database...")
+
     init_database()
+
+    # Start Flask keep-alive server.
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True,
+    )
+
+    web_thread.start()
+
+    print("Flask keep-alive server started.")
+
+    # --------------------------------------------------------
+    # Telegram application
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
@@ -1082,7 +1570,51 @@ def main():
     )
 
     # --------------------------------------------------------
-    # BASIC COMMANDS
+    # Voting conversation
+    # --------------------------------------------------------
+
+    vote_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                start_vote,
+                pattern="^vote$",
+            )
+        ],
+
+        states={
+            SELECT_CANDIDATE: [
+                CallbackQueryHandler(
+                    select_candidate,
+                    pattern="^(candidate_[0-9]+|cancel_vote)$",
+                )
+            ],
+
+            ENTER_STUDENT_ID: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_student_id,
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_vote,
+            ),
+            CallbackQueryHandler(
+                cancel_vote,
+                pattern="^cancel_vote$",
+            ),
+        ],
+
+        per_chat=True,
+        per_user=True,
+        per_message=False,
+    )
+
+    # --------------------------------------------------------
+    # Basic commands
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1090,120 +1622,100 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("myid", my_id)
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("myid", myid_command)
+    )
+
+    application.add_handler(
+        CommandHandler("myscore", myscore_command)
     )
 
     # --------------------------------------------------------
-    # ADMIN
+    # Admin commands
     # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
             "start_election",
-            start_election_command
+            start_election_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "stop_election",
-            stop_election_command
+            stop_election_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "results",
-            admin_results
+            results_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "nonvoters",
-            admin_nonvoters
+            nonvoters_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "attempts",
-            admin_attempts
+            attempts_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "logs",
-            admin_logs
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "myscore",
-            my_score
+            logs_command,
         )
     )
 
     # --------------------------------------------------------
-    # MAIN VOTING CONVERSATION
-    # --------------------------------------------------------
-
-    voting_conversation = ConversationHandler(
-
-        entry_points=[
-            CallbackQueryHandler(
-                vote_start,
-                pattern="^vote$"
-            )
-        ],
-
-        states={
-
-            SELECTING_CANDIDATE: [
-                CallbackQueryHandler(
-                    candidate_selected,
-                    pattern=r"^candidate:\d+$"
-                )
-            ],
-
-            WAITING_FOR_ID: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    receive_student_id
-                )
-            ],
-        },
-
-        fallbacks=[
-            CommandHandler("start", start)
-        ],
-
-        allow_reentry=True,
-    )
-
-    application.add_handler(voting_conversation)
-
-    # --------------------------------------------------------
-    # NON-CONVERSATION BUTTONS
+    # Menu callbacks
     # --------------------------------------------------------
 
     application.add_handler(
         CallbackQueryHandler(
-            rules,
-            pattern="^rules$"
+            show_rules,
+            pattern="^rules$",
         )
     )
 
     application.add_handler(
         CallbackQueryHandler(
-            candidates,
-            pattern="^candidates$"
+            show_candidates,
+            pattern="^candidates$",
         )
+    )
+
+    # Voting conversation must be registered after menu
+    # callbacks and before generic message handlers.
+    application.add_handler(
+        vote_conversation
+    )
+
+    # --------------------------------------------------------
+    # Error handler
+    # --------------------------------------------------------
+
+    application.add_error_handler(
+        error_handler
     )
 
     print("🚀 Section B Election Bot is running...")
+
+    # --------------------------------------------------------
+    # Telegram polling
+    # --------------------------------------------------------
 
     application.run_polling(
         drop_pending_updates=True,
