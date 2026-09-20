@@ -1205,7 +1205,15 @@ def main():
 
     print("🚀 Section B Election Bot is running...")
 
-    application.run_polling()
+    application.run_polling(
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
