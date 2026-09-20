@@ -634,6 +634,40 @@ def get_total_ballots():
 # ============================================================
 # GROUP WINNER ANNOUNCEMENT
 # ============================================================
+async def test_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only test for the election group announcement."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    if not ELECTION_GROUP_CHAT_ID:
+        await update.message.reply_text(
+            "ELECTION_GROUP_CHAT_ID is not configured."
+        )
+        return
+
+    try:
+        await context.application.bot.send_message(
+            chat_id=ELECTION_GROUP_CHAT_ID,
+            text=(
+                "🧪 ELECTION BOT TEST\n\n"
+                "This is a test message to verify that the bot "
+                "can send election announcements to this group.\n\n"
+                "No votes were created or changed.\n"
+                "The election has NOT been started."
+            ),
+        )
+
+        await update.message.reply_text(
+            "✅ Test announcement sent to the election group."
+        )
+
+    except Exception as e:
+        print(f"Test announcement error: {e}")
+        await update.message.reply_text(
+            "❌ Failed to send the test announcement.\n"
+            "Check the Render logs."
+        )
 
 async def announce_winner(application):
     """
@@ -1946,6 +1980,12 @@ def main():
             "help",
             help_command,
         )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "test_announcement", 
+            test_announcement)
     )
 
     application.add_handler(
