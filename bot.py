@@ -77,70 +77,68 @@ CANDIDATES = {
 # ============================================================
 
 VOTER_DATA = {
-    """
-UGR/6881/17|ABENET TILAHUN SOLOMON
-UGR/0202/17|Abigiya Aklilu Wendafirash
-UGR/7506/17|AMANUEL GETACHEW TEKA
-UGR/2686/17|Amdiyon Mifta Ahmed
-UGR/6329/17|Beimnet Tasew Tsegaye
-UGR/0253/17|Bilise Motuma Begna
-UGR/0349/17|Biruktawit Zelalem Nigatu
-UGR/4198/17|Blen Gebrehiwet Areaya
-UGR/5340/17|Dagim Badeg Banata
-UGR/1314/17|DANIEl Getahun Feleke
-UGR/9683/17|DENEKEW TADELE YIHUN
-UGR/9872/16|Ebtisam Sultan Adam
-UGR/2353/17|Edom Tadesse Berhanu
-UGR/4938/17|Elsabeth Mahteme Kifle
-UGR/3391/17|Ephrata Mebt Admass
-UGR/7557/17|Ephrem Teshome Kebede
-UGR/0996/17|Essey Kifleeyesus Kidane
-UGR/7434/17|Eyasu Solomon Sando
-UGR/5704/17|Eyosiyas Geremew Kebede
-UGR/2958/17|Fares Girum Kebede
-UGR/2135/17|Fitsum Girma Abadi
-UGR/6622/17|Gadisa Takele Begna
-UGR/3489/17|GIFTI TESFAYE GUDETA
-UGR/0162/17|Girum Muluken Assefa
-UGR/4727/17|Haileyesus Tadesse Birhanu
-UGR/6318/17|Hemen Anteneh Chekol
-UGR/7290/17|Hilina Tadesse Gebremeskel
-UGR/3854/17|Hiluf Girmay Berhe
-UGR/9900/17|Kalid Sultan Barsebo
-UGR/2542/17|Kalkidan Getenet Tadesse
-UGR/3435/17|Kirubel Belayneh Abat
-UGR/0737/17|Lensa Tariku Oluma
-UGR/6534/17|Leul Ephrem Bezu
-UGR/2398/17|Mahlet Zerihun Tefera
-UGR/9262/17|Mariamawit Nigussie Bikila
-UGR/8716/17|Meklit Gebremichael Deres
-UGR/4754/17|Meti Teshome Alemu
-UGR/9905/17|Mihretab Kushe Kussa
-UGR/6094/17|Nahom Lulu Mulugeta
-UGR/2414/17|Nahom Zelalem Fisseha
-UGR/6076/17|Nanati Abdissa Kumssa
-UGR/5338/17|Nathanael Mehari Cherkos
-UGR/4666/17|Nebiyu Esayas Bayisa
-UGR/0507/17|Nigus Gebremedhin Tesfay
-UGR/8472/17|Osman Mahmud Tesiso
-UGR/7081/17|Peniel Mulugeta ALEMAYEHU
-UGR/4559/17|RUMEYSUA ABDUSELAM ANWAR
-UGR/2093/17|Salem Kassahun Gararo
-UGR/6704/17|salsawit abera asrat
-UGR/7152/17|Selamawit Fikru Shikur
-UGR/3303/17|Solomon Mesfin Moges
-UGR/9309/17|Teamir Mulye Tesfaye
-UGR/5199/17|Tesnim Hussein Mohammed
-UGR/7046/17|Tinsae Shemeles Tadesse
-UGR/9202/17|Tsigereda Abebaw Balew
-UGR/1574/17|Tsion Dereje Oda
-UGR/7293/17|YIDIDIYA MERKINEH MENA
-UGR/6785/17|Yodahe Samuel Desta
-UGR/4908/17|Yonas Solomon Fikru
-UGR/5150/17|Yonatan Hagos Woldegebriel
-UGR/8278/17|Yosef Amdneh Ebsa
-UGR/0393/17|Zekariyas Niguse Teka
-"""
+    "UGR/6881/17": "ABENET TILAHUN SOLOMON",
+    "UGR/0*202*/17": "Abigiya Aklilu Wendafirash",
+    "UGR/7506/17": "AMANUEL GETACHEW TEKA",
+    "UGR/2686/17": "Amdiyon Mifta Ahmed",
+    "UGR/6329/17": "Beimnet Tasew Tsegaye",
+    "UGR/0*253*/17": "Bilise Motuma Begna",
+    "UGR/0*349*/17": "Biruktawit Zelalem Nigatu",
+    "UGR/4198/17": "Blen Gebrehiwet Areaya",
+    "UGR/5340/17": "Dagim Badeg Banata",
+    "UGR/1314/17": "DANIEl Getahun Feleke",
+    "UGR/9683/17": "DENEKEW TADELE YIHUN",
+    "UGR/9872/16": "Ebtisam Sultan Adam",
+    "UGR/2353/17": "Edom Tadesse Berhanu",
+    "UGR/4938/17": "Elsabeth Mahteme Kifle",
+    "UGR/3391/17": "Ephrata Mebt Admass",
+    "UGR/7557/17": "Ephrem Teshome Kebede",
+    "UGR/0*996*/17": "Essey Kifleeyesus Kidane",
+    "UGR/7434/17": "Eyasu Solomon Sando",
+    "UGR/5704/17": "Eyosiyas Geremew Kebede",
+    "UGR/2958/17": "Fares Girum Kebede",
+    "UGR/2135/17": "Fitsum Girma Abadi",
+    "UGR/6622/17": "Gadisa Takele Begna",
+    "UGR/3489/17": "GIFTI TESFAYE GUDETA",
+    "UGR/0*162*/17": "Girum Muluken Assefa",
+    "UGR/4727/17": "Haileyesus Tadesse Birhanu",
+    "UGR/6318/17": "Hemen Anteneh Chekol",
+    "UGR/7290/17": "Hilina Tadesse Gebremeskel",
+    "UGR/3854/17": "Hiluf Girmay Berhe",
+    "UGR/9900/17": "Kalid Sultan Barsebo",
+    "UGR/2542/17": "Kalkidan Getenet Tadesse",
+    "UGR/3435/17": "Kirubel Belayneh Abat",
+    "UGR/0*737*/17": "Lensa Tariku Oluma",
+    "UGR/6534/17": "Leul Ephrem Bezu",
+    "UGR/2398/17": "Mahlet Zerihun Tefera",
+    "UGR/9262/17": "Mariamawit Nigussie Bikila",
+    "UGR/8716/17": "Meklit Gebremichael Deres",
+    "UGR/4754/17": "Meti Teshome Alemu",
+    "UGR/9905/17": "Mihretab Kushe Kussa",
+    "UGR/6094/17": "Nahom Lulu Mulugeta",
+    "UGR/2414/17": "Nahom Zelalem Fisseha",
+    "UGR/6076/17": "Nanati Abdissa Kumssa",
+    "UGR/5338/17": "Nathanael Mehari Cherkos",
+    "UGR/4666/17": "Nebiyu Esayas Bayisa",
+    "UGR/0*507*/17": "Nigus Gebremedhin Tesfay",
+    "UGR/8472/17": "Osman Mahmud Tesiso",
+    "UGR/7081/17": "Peniel Mulugeta ALEMAYEHU",
+    "UGR/4559/17": "RUMEYSUA ABDUSELAM ANWAR",
+    "UGR/2093/17": "Salem Kassahun Gararo",
+    "UGR/6704/17": "salsawit abera asrat",
+    "UGR/7152/17": "Selamawit Fikru Shikur",
+    "UGR/3303/17": "Solomon Mesfin Moges",
+    "UGR/9309/17": "Teamir Mulye Tesfaye",
+    "UGR/5199/17": "Tesnim Hussein Mohammed",
+    "UGR/7046/17": "Tinsae Shemeles Tadesse",
+    "UGR/9202/17": "Tsigereda Abebaw Balew",
+    "UGR/1574/17": "Tsion Dereje Oda",
+    "UGR/7293/17": "YIDIDIYA MERKINEH MENA",
+    "UGR/6785/17": "Yodahe Samuel Desta",
+    "UGR/4908/17": "Yonas Solomon Fikru",
+    "UGR/5150/17": "Yonatan Hagos Woldegebriel",
+    "UGR/8278/17": "Yosef Amdneh Ebsa",
+    "UGR/0*393*/17": "Zekariyas Niguse Teka",
 }
 
 
