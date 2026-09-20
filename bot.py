@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -46,6 +47,16 @@ ADMIN_IDS = {
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip()
 }
+
+# Telegram group where the final election result will be announced.
+#
+# Render variable:
+# ELECTION_GROUP_CHAT_ID=-1001234567890
+#
+ELECTION_GROUP_CHAT_ID = os.getenv(
+    "ELECTION_GROUP_CHAT_ID",
+    ""
+).strip()
 
 
 # ============================================================
@@ -97,9 +108,15 @@ def get_optional_telegram_id(environment_name):
 
 
 CANDIDATE_TELEGRAM_IDS = {
-    1: get_optional_telegram_id("BIRUKTAWIT_TELEGRAM_ID"),
-    2: get_optional_telegram_id("MIHRETAB_TELEGRAM_ID"),
-    3: get_optional_telegram_id("DAGIM_TELEGRAM_ID"),
+    1: get_optional_telegram_id(
+        "BIRUKTAWIT_TELEGRAM_ID"
+    ),
+    2: get_optional_telegram_id(
+        "MIHRETAB_TELEGRAM_ID"
+    ),
+    3: get_optional_telegram_id(
+        "DAGIM_TELEGRAM_ID"
+    ),
 }
 
 
@@ -199,7 +216,11 @@ def health():
 
 def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+    )
 
 
 # ============================================================
@@ -264,7 +285,10 @@ def init_database():
                     END
                 WHERE id = 1
                   AND status IS NULL
-            """, (ELECTION_OPEN, ELECTION_READY))
+            """, (
+                ELECTION_OPEN,
+                ELECTION_READY,
+            ))
 
             # ------------------------------------------------
             # Anonymous ballot table
@@ -332,7 +356,10 @@ def init_database():
                         (%s, %s)
                     ON CONFLICT (student_id)
                     DO UPDATE SET name = EXCLUDED.name
-                """, (student_id, name))
+                """, (
+                    student_id,
+                    name,
+                ))
 
         conn.commit()
 
@@ -367,6 +394,9 @@ def election_active():
 
     If the 13-hour deadline has passed, permanently changes
     the election state to FINAL.
+
+    This function only changes the database state.
+    The asynchronous announcement is handled separately.
     """
 
     now = datetime.now(timezone.utc)
@@ -408,9 +438,15 @@ def election_active():
                     SET
                         active = FALSE,
                         status = %s,
-                        finalized_at = COALESCE(finalized_at, %s)
+                        finalized_at = COALESCE(
+                            finalized_at,
+                            %s
+                        )
                     WHERE id = 1
-                """, (ELECTION_FINAL, now))
+                """, (
+                    ELECTION_FINAL,
+                    now,
+                ))
 
                 conn.commit()
 
@@ -426,7 +462,9 @@ def election_active():
 def start_election():
 
     now = datetime.now(timezone.utc)
-    ends_at = now + timedelta(hours=ELECTION_DURATION_HOURS)
+    ends_at = now + timedelta(
+        hours=ELECTION_DURATION_HOURS
+    )
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -449,14 +487,20 @@ def start_election():
 
             # FINAL elections can NEVER be reopened.
             if status == ELECTION_FINAL:
+
                 return (
                     False,
-                    "The election is already FINAL and cannot be reopened."
+                    "The election is already FINAL and "
+                    "cannot be reopened."
                 )
 
             # Already running
             if status == ELECTION_OPEN:
-                return False, "The election is already open."
+
+                return (
+                    False,
+                    "The election is already open."
+                )
 
             # Start election
             cur.execute("""
@@ -507,10 +551,18 @@ def finalize_election():
             status = election["status"]
 
             if status == ELECTION_FINAL:
-                return False, "The election is already FINAL."
+
+                return (
+                    False,
+                    "The election is already FINAL."
+                )
 
             if status != ELECTION_OPEN:
-                return False, "The election is not currently open."
+
+                return (
+                    False,
+                    "The election is not currently open."
+                )
 
             cur.execute("""
                 UPDATE election
@@ -558,6 +610,7 @@ def get_candidate_votes():
                 candidate_id = row["candidate_id"]
 
                 if candidate_id in results:
+
                     results[candidate_id] = row["vote_count"]
 
     return results
@@ -579,6 +632,256 @@ def get_total_ballots():
 
 
 # ============================================================
+# GROUP WINNER ANNOUNCEMENT
+# ============================================================
+
+async def announce_winner(application):
+    """
+    Announce the final election result in the configured
+    Section B Telegram group.
+
+    The announcement contains:
+        - election status
+        - winner, if there is one
+        - final candidate totals
+        - total anonymous ballots
+
+    It does NOT reveal:
+        - which voter voted for which candidate
+        - voter identity
+        - Telegram IDs
+    """
+
+    if not ELECTION_GROUP_CHAT_ID:
+
+        print(
+            "ELECTION_GROUP_CHAT_ID is not configured. "
+            "Winner announcement skipped."
+        )
+
+        return
+
+    # Verify the election is actually FINAL before announcing.
+    election = get_election()
+
+    if not election:
+        print(
+            "Election record unavailable. "
+            "Winner announcement skipped."
+        )
+        return
+
+    if election["status"] != ELECTION_FINAL:
+
+        print(
+            "Election is not FINAL. "
+            "Winner announcement skipped."
+        )
+
+        return
+
+    results = get_candidate_votes()
+    total_votes = sum(results.values())
+
+    # --------------------------------------------------------
+    # No votes
+    # --------------------------------------------------------
+
+    if total_votes == 0:
+
+        message = (
+            "🗳️ SECTION B ELECTION\n\n"
+            "The election has ended.\n\n"
+            "No valid ballots were recorded."
+        )
+
+    else:
+
+        max_votes = max(results.values())
+
+        winners = [
+            candidate_id
+            for candidate_id, votes in results.items()
+            if votes == max_votes
+        ]
+
+        # ----------------------------------------------------
+        # Tie
+        # ----------------------------------------------------
+
+        if len(winners) > 1:
+
+            tied_candidates = "\n".join(
+                f"• {CANDIDATES[candidate_id]} — "
+                f"{results.get(candidate_id, 0)} votes"
+                for candidate_id in winners
+            )
+
+            vote_lines = "\n".join(
+                f"• {CANDIDATES[candidate_id]} — "
+                f"{results.get(candidate_id, 0)} votes"
+                for candidate_id in CANDIDATES
+            )
+
+            message = (
+                "🗳️ SECTION B ELECTION\n\n"
+                "The election has ended.\n\n"
+                "⚖️ RESULT: TIE\n\n"
+                f"{tied_candidates}\n\n"
+                "📊 FINAL RESULTS\n"
+                f"{vote_lines}\n\n"
+                f"Total valid ballots: {total_votes}"
+            )
+
+        # ----------------------------------------------------
+        # One winner
+        # ----------------------------------------------------
+
+        else:
+
+            winner_id = winners[0]
+            winner_name = CANDIDATES[winner_id]
+            winner_votes = results[winner_id]
+
+            vote_lines = "\n".join(
+                f"• {CANDIDATES[candidate_id]} — "
+                f"{results.get(candidate_id, 0)} votes"
+                for candidate_id in CANDIDATES
+            )
+
+            message = (
+                "🗳️ SECTION B ELECTION\n\n"
+                "The election has ended.\n\n"
+                "🏆 WINNER\n"
+                f"{winner_name}\n"
+                f"Votes: {winner_votes}\n\n"
+                "📊 FINAL RESULTS\n"
+                f"{vote_lines}\n\n"
+                f"Total valid ballots: {total_votes}"
+            )
+
+    try:
+
+        await application.bot.send_message(
+            chat_id=int(ELECTION_GROUP_CHAT_ID),
+            text=message,
+        )
+
+        print(
+            "Election result announcement sent successfully."
+        )
+
+    except Exception as e:
+
+        print(
+            f"Failed to announce election result: {e}"
+        )
+
+
+# ============================================================
+# AUTOMATIC ELECTION DEADLINE MONITOR
+# ============================================================
+
+async def election_deadline_monitor(application):
+    """
+    Background monitor.
+
+    Checks the election periodically.
+
+    When the 13-hour deadline is reached:
+        1. Election becomes FINAL.
+        2. Voting closes.
+        3. Final results are calculated.
+        4. Winner/final result is announced in the group.
+
+    This also works if Render restarts while an election
+    is already in progress because the deadline is stored
+    in the database.
+    """
+
+    print("⏱️ Election deadline monitor started.")
+
+    while True:
+
+        try:
+
+            election = get_election()
+
+            if election:
+
+                status = election["status"]
+                ends_at = election["ends_at"]
+
+                if (
+                    status == ELECTION_OPEN
+                    and ends_at is not None
+                ):
+
+                    now = datetime.now(timezone.utc)
+
+                    if now >= ends_at:
+
+                        # Attempt to finalize.
+                        success, result = finalize_election()
+
+                        if success:
+
+                            print(
+                                "⏰ Election deadline reached."
+                            )
+
+                            print(
+                                "🔒 Election automatically "
+                                "finalized."
+                            )
+
+                            await announce_winner(
+                                application
+                            )
+
+            # Check once every 15 seconds.
+            await asyncio.sleep(15)
+
+        except asyncio.CancelledError:
+
+            print(
+                "Election deadline monitor stopped."
+            )
+
+            raise
+
+        except Exception as e:
+
+            print(
+                f"Election deadline monitor error: {e}"
+            )
+
+            # Do not kill the monitor because of a temporary
+            # database/network problem.
+            await asyncio.sleep(15)
+
+
+# ============================================================
+# APPLICATION STARTUP
+# ============================================================
+
+async def post_init(application):
+    """
+    Runs after Telegram application initialization.
+
+    Starts the background election deadline monitor.
+    """
+
+    application.create_task(
+        election_deadline_monitor(application)
+    )
+
+    print(
+        "✅ Automatic election deadline monitoring enabled."
+    )
+
+
+# ============================================================
 # /START
 # ============================================================
 
@@ -592,12 +895,15 @@ async def start_command(
     status = election["status"]
 
     if status == ELECTION_OPEN:
+
         status_text = "🟢 OPEN"
 
     elif status == ELECTION_FINAL:
+
         status_text = "🔒 FINAL"
 
     else:
+
         status_text = "⚪ READY"
 
     text = (
@@ -612,8 +918,7 @@ async def start_command(
         "📌 Rules:\n"
         "• Only eligible Section B students may vote.\n"
         "• Each normal voter may cast one valid ballot.\n"
-        "• The designated test voter UGR/6094/17 is intentionally "
-        "allowed multiple valid ballots.\n"
+        "• Only the candidate who receives the highest number of votes wins the position of class representative.\n"
         "• Student ID is used for eligibility verification.\n"
         "• Candidate choices are stored separately from voter identity.\n"
         "• Invalid Student IDs do not create ballots.\n"
@@ -640,11 +945,15 @@ async def start_vote(
 
         election = get_election()
 
-        if election and election["status"] == ELECTION_FINAL:
+        if (
+            election
+            and election["status"] == ELECTION_FINAL
+        ):
 
             await update.message.reply_text(
                 "🔒 The election is FINAL.\n\n"
-                "Voting is closed and the election cannot be reopened."
+                "Voting is closed and the election cannot "
+                "be reopened."
             )
 
         else:
@@ -697,7 +1006,9 @@ async def select_candidate(
 
     await query.answer()
 
-    candidate_id = int(query.data.split("_")[1])
+    candidate_id = int(
+        query.data.split("_")[1]
+    )
 
     if candidate_id not in CANDIDATES:
 
@@ -707,7 +1018,9 @@ async def select_candidate(
 
         return ConversationHandler.END
 
-    context.user_data["pending_candidate"] = candidate_id
+    context.user_data[
+        "pending_candidate"
+    ] = candidate_id
 
     await query.edit_message_text(
         "Please enter your Section B Student ID.\n\n"
@@ -730,12 +1043,15 @@ async def receive_student_id(
     student_id = update.message.text.strip()
     telegram_id = update.effective_user.id
 
-    candidate_id = context.user_data.get("pending_candidate")
+    candidate_id = context.user_data.get(
+        "pending_candidate"
+    )
 
     if candidate_id not in CANDIDATES:
 
         await update.message.reply_text(
-            "❌ Your voting session expired. Please use /vote again."
+            "❌ Your voting session expired. "
+            "Please use /vote again."
         )
 
         context.user_data.clear()
@@ -795,7 +1111,10 @@ async def receive_student_id(
             # Election not open
             # -------------------------------------------------
 
-            if status != ELECTION_OPEN or not election["active"]:
+            if (
+                status != ELECTION_OPEN
+                or not election["active"]
+            ):
 
                 conn.rollback()
 
@@ -818,7 +1137,10 @@ async def receive_student_id(
                     SET
                         active = FALSE,
                         status = %s,
-                        finalized_at = COALESCE(finalized_at, %s)
+                        finalized_at = COALESCE(
+                            finalized_at,
+                            %s
+                        )
                     WHERE id = 1
                 """, (
                     ELECTION_FINAL,
@@ -835,6 +1157,7 @@ async def receive_student_id(
 
                 context.user_data.clear()
 
+                # The background monitor will announce the result.
                 return ConversationHandler.END
 
             # =================================================
@@ -1043,6 +1366,7 @@ async def receive_student_id(
 # ============================================================
 
 def is_admin(user_id):
+
     return user_id in ADMIN_IDS
 
 
@@ -1055,7 +1379,9 @@ async def start_election_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1078,9 +1404,12 @@ async def start_election_command(
     await update.message.reply_text(
         "🟢 SECTION B ELECTION STARTED\n\n"
         f"Duration: {ELECTION_DURATION_HOURS} hours\n"
-        f"Ends at: {ends_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        "The election will automatically become FINAL "
+        f"Ends at: "
+        f"{ends_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "The bot will automatically finalize the election "
         "when the 13-hour period ends.\n\n"
+        "The final result will then be announced in the "
+        "Section B group.\n\n"
         "Once FINAL, it cannot be reopened."
     )
 
@@ -1095,7 +1424,9 @@ async def finalize_election_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1115,12 +1446,19 @@ async def finalize_election_command(
 
     finalized_at = result
 
+    # Announce final result immediately.
+    await announce_winner(
+        context.application
+    )
+
     await update.message.reply_text(
         "🔒 ELECTION FINALIZED\n\n"
         f"Finalized at: "
         f"{finalized_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         "The election can no longer accept votes "
-        "and cannot be reopened."
+        "and cannot be reopened.\n\n"
+        "📢 The final result has been announced "
+        "in the Section B group."
     )
 
 
@@ -1133,7 +1471,9 @@ async def results_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1142,6 +1482,9 @@ async def results_command(
         return
 
     # Automatically finalize if deadline has passed.
+    #
+    # The background monitor normally handles this,
+    # but this provides another safety check.
     election_active()
 
     election = get_election()
@@ -1151,12 +1494,15 @@ async def results_command(
     status = election["status"]
 
     if status == ELECTION_FINAL:
+
         status_text = "🔒 FINAL"
 
     elif status == ELECTION_OPEN:
+
         status_text = "🟢 OPEN"
 
     else:
+
         status_text = "⚪ READY"
 
     text = (
@@ -1193,7 +1539,9 @@ async def nonvoters_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1244,7 +1592,9 @@ async def attempts_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1280,8 +1630,15 @@ async def attempts_command(
 
     for row in rows:
 
-        student_id = row["student_id"] or "N/A"
-        telegram_id = row["telegram_id"] or "N/A"
+        student_id = (
+            row["student_id"]
+            or "N/A"
+        )
+
+        telegram_id = (
+            row["telegram_id"]
+            or "N/A"
+        )
 
         text += (
             f"Student ID: {student_id}\n"
@@ -1304,7 +1661,9 @@ async def logs_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
 
         await update.message.reply_text(
             "❌ Admin only."
@@ -1338,27 +1697,25 @@ async def myscore_command(
     candidate_id = None
 
     # Find the candidate associated with this Telegram account.
-    #
-    # CANDIDATE_TELEGRAM_IDS is:
-    #
-    # {
-    #     1: Biruktawit's Telegram ID,
-    #     2: Mihretab's Telegram ID,
-    #     3: Dagim's Telegram ID
-    # }
 
-    for cid, candidate_telegram_id in CANDIDATE_TELEGRAM_IDS.items():
+    for cid, candidate_telegram_id in (
+        CANDIDATE_TELEGRAM_IDS.items()
+    ):
 
         if candidate_telegram_id is not None:
+
             if telegram_id == candidate_telegram_id:
+
                 candidate_id = cid
+
                 break
 
     # Not a configured candidate.
     if candidate_id is None:
 
         await update.message.reply_text(
-            "❌ This command is available only to configured candidates."
+            "❌ This command is available only "
+            "to configured candidates."
         )
 
         return
@@ -1366,7 +1723,10 @@ async def myscore_command(
     # Get aggregate anonymous vote totals.
     results = get_candidate_votes()
 
-    vote_count = results.get(candidate_id, 0)
+    vote_count = results.get(
+        candidate_id,
+        0,
+    )
 
     await update.message.reply_text(
         f"📊 YOUR CURRENT SCORE\n\n"
@@ -1391,6 +1751,21 @@ async def myid_command(
 
 
 # ============================================================
+# /CHATID
+# ============================================================
+
+async def chatid_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "This chat ID is:\n\n"
+        f"{update.effective_chat.id}"
+    )
+
+
+# ============================================================
 # /HELP
 # ============================================================
 
@@ -1405,6 +1780,7 @@ async def help_command(
         "/start — Election information\n"
         "/vote — Cast your ballot\n"
         "/myid — Show your Telegram ID\n"
+        "/chatid — Show this chat's ID\n"
         "/help — Show this help\n\n"
 
         "Admin commands:\n"
@@ -1451,37 +1827,65 @@ async def cancel_command(
 def main():
 
     if not TOKEN:
+
         raise RuntimeError(
             "TOKEN environment variable is missing."
         )
 
     if not DATABASE_URL:
+
         raise RuntimeError(
             "DATABASE_URL environment variable is missing."
         )
 
-    # Initialize database
+    # --------------------------------------------------------
+    # Database initialization
+    # --------------------------------------------------------
+
     init_database()
 
-    # Start Flask keep-alive server
+    # --------------------------------------------------------
+    # Flask keep-alive server
+    # --------------------------------------------------------
+
     threading.Thread(
         target=run_flask,
         daemon=True,
     ).start()
 
-    print("🚀 Section B Election Bot is running...")
+    print(
+        "🚀 Section B Election Bot is running..."
+    )
+
+    if ELECTION_GROUP_CHAT_ID:
+
+        print(
+            "📢 Group winner announcement is configured."
+        )
+
+    else:
+
+        print(
+            "⚠️ ELECTION_GROUP_CHAT_ID is not configured."
+        )
+
+    # --------------------------------------------------------
+    # Telegram application
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
         .token(TOKEN)
+        .post_init(post_init)
         .build()
     )
 
-    # --------------------------------------------------------
-    # Voting conversation
-    # --------------------------------------------------------
+    # ========================================================
+    # VOTING CONVERSATION
+    # ========================================================
 
     vote_conversation = ConversationHandler(
+
         entry_points=[
             CommandHandler(
                 "vote",
@@ -1492,35 +1896,43 @@ def main():
         states={
 
             SELECTING_CANDIDATE: [
+
                 CallbackQueryHandler(
                     select_candidate,
                     pattern=r"^candidate_[1-3]$",
                 )
+
             ],
 
             ENTERING_STUDENT_ID: [
+
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     receive_student_id,
                 )
+
             ],
         },
 
         fallbacks=[
+
             CommandHandler(
                 "cancel",
                 cancel_command,
             ),
+
         ],
 
         per_message=False,
     )
 
-    application.add_handler(vote_conversation)
+    application.add_handler(
+        vote_conversation
+    )
 
-    # --------------------------------------------------------
-    # General commands
-    # --------------------------------------------------------
+    # ========================================================
+    # GENERAL COMMANDS
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1545,14 +1957,21 @@ def main():
 
     application.add_handler(
         CommandHandler(
+            "chatid",
+            chatid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
             "myscore",
             myscore_command,
         )
     )
 
-    # --------------------------------------------------------
-    # Admin commands
-    # --------------------------------------------------------
+    # ========================================================
+    # ADMIN COMMANDS
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1604,9 +2023,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # Start polling
-    # --------------------------------------------------------
+    # ========================================================
+    # START POLLING
+    # ========================================================
 
     application.run_polling(
         drop_pending_updates=True,
@@ -1618,6 +2037,10 @@ def main():
         pool_timeout=30,
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
