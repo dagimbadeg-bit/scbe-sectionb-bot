@@ -8,14 +8,11 @@ Required environment variables:
   DATABASE_URL  Supabase PostgreSQL connection string
   ADMIN_IDS     Comma-separated Telegram numeric IDs for Super Admins
 
-Supported grade-file columns:
-  student_id, score
-Optional columns:
-  full_name (ignored for matching; student_id is authoritative)
-
-CSV and XLSX files are supported. An instructor must create an assessment
-before uploading marks for it. Uploads are validated completely before
-database changes are committed.
+Supported grade-file formats include the university sheet headings:
+  STUDENT ID NO | FULL NAME | GENDER | SECTION | Score
+and simplified headings such as student_id, score.
+Student ID is authoritative; full name and gender are retained for reference.
+CSV and XLSX files are supported. Uploads are validated before database changes.
 """
 
 import os
@@ -801,9 +798,61 @@ async def assessment_max_step(update, context):
 # Grade file parsing and validation
 # ---------------------------------------------------------------------------
 
+def _normalize_grade_header(value):
+    """Normalize a spreadsheet heading so punctuation/case do not matter."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _grade_column_indexes(headers):
+    """Map recognized university and generic headings to column indexes."""
+    aliases = {
+        "student_id": {
+            "studentidno", "studentidnumber", "studentid", "studentno",
+            "studentnumber", "idno", "idnumber", "studentcode"
+        },
+        "full_name": {"fullname", "studentname", "name"},
+        "gender": {"gender", "sex"},
+        "section": {"section", "classsection", "group"},
+        "score": {"score", "mark", "marks", "grade", "result", "total"}
+    }
+    indexes = {}
+    for index, heading in enumerate(headers):
+        normalized = _normalize_grade_header(heading)
+        if not normalized:
+            continue
+        for field, accepted in aliases.items():
+            if normalized in accepted and field not in indexes:
+                indexes[field] = index
+    if "student_id" not in indexes or "score" not in indexes:
+        raise ValueError(
+            "Could not identify the required columns. Include headings such as "
+            "'STUDENT ID NO' and 'Score' (or 'student_id' and 'score')."
+        )
+    return indexes
+
+
+def _cell_text(value):
+    if value is None:
+        return ""
+    # Excel may represent an integer-valued numeric ID as 6881.0. Do not
+    # silently rewrite identifiers with leading zeros or embedded separators.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
 def parse_grade_file(filename, raw_bytes):
+    """Parse the original Section B grade sheet or a simplified grade file.
+
+    Required columns: Student ID and Score.
+    Recognized optional columns: Full Name, Gender and Section.
+    Extra columns (for example No.) are ignored. Completely empty rows are
+    skipped; a row with an ID but no score is retained for validation and
+    rejected rather than silently treated as zero.
+    """
     extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     rows = []
+
     if extension == "csv":
         text_data = None
         for encoding in ("utf-8-sig", "utf-8", "cp1252"):
@@ -814,47 +863,59 @@ def parse_grade_file(filename, raw_bytes):
                 continue
         if text_data is None:
             raise ValueError("CSV encoding is not supported. Save it as UTF-8 CSV.")
-        reader = csv.DictReader(io.StringIO(text_data))
-        if not reader.fieldnames:
+
+        reader = csv.reader(io.StringIO(text_data))
+        headers = next(reader, None)
+        if not headers:
             raise ValueError("CSV file is empty or has no header row.")
-        normalized = {h.strip().lower(): h for h in reader.fieldnames if h}
-        if "student_id" not in normalized or "score" not in normalized:
-            raise ValueError("Required CSV headers: student_id, score.")
-        for line_number, row in enumerate(reader, start=2):
+        indexes = _grade_column_indexes(headers)
+        for line_number, values in enumerate(reader, start=2):
+            if not any(_cell_text(value) for value in values):
+                continue
+            def get_value(field):
+                index = indexes.get(field)
+                return _cell_text(values[index]) if index is not None and index < len(values) else ""
             rows.append({
                 "line": line_number,
-                "student_id": str(row.get(normalized["student_id"], "")).strip(),
-                "score": str(row.get(normalized["score"], "")).strip()
+                "student_id": get_value("student_id"),
+                "full_name": get_value("full_name"),
+                "gender": get_value("gender"),
+                "section": get_value("section"),
+                "score": get_value("score")
             })
+
     elif extension in ("xlsx", "xlsm"):
         if load_workbook is None:
             raise ValueError("Excel support is not installed. Add openpyxl to requirements.txt.")
         workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-        sheet = workbook.active
-        iterator = sheet.iter_rows(values_only=True)
-        headers = next(iterator, None)
-        if not headers:
-            raise ValueError("Excel file is empty.")
-        normalized = {
-            str(value).strip().lower(): index
-            for index, value in enumerate(headers) if value is not None
-        }
-        if "student_id" not in normalized or "score" not in normalized:
-            raise ValueError("Required Excel headers: student_id, score.")
-        for line_number, values in enumerate(iterator, start=2):
-            sid = values[normalized["student_id"]] if normalized["student_id"] < len(values) else ""
-            score = values[normalized["score"]] if normalized["score"] < len(values) else ""
-            rows.append({
-                "line": line_number,
-                "student_id": "" if sid is None else str(sid).strip(),
-                "score": "" if score is None else str(score).strip()
-            })
-        workbook.close()
+        try:
+            sheet = workbook.active
+            iterator = sheet.iter_rows(values_only=True)
+            headers = next(iterator, None)
+            if not headers:
+                raise ValueError("Excel file is empty.")
+            indexes = _grade_column_indexes(headers)
+            for line_number, values in enumerate(iterator, start=2):
+                if not any(_cell_text(value) for value in values):
+                    continue
+                def get_value(field):
+                    index = indexes.get(field)
+                    return _cell_text(values[index]) if index is not None and index < len(values) else ""
+                rows.append({
+                    "line": line_number,
+                    "student_id": get_value("student_id"),
+                    "full_name": get_value("full_name"),
+                    "gender": get_value("gender"),
+                    "section": get_value("section"),
+                    "score": get_value("score")
+                })
+        finally:
+            workbook.close()
     else:
         raise ValueError("Upload a .csv or .xlsx file.")
 
     if not rows:
-        raise ValueError("No grade rows were found.")
+        raise ValueError("No grade rows were found below the header row.")
     return rows
 
 
@@ -940,12 +1001,11 @@ async def upload_assessment_callback(update, context):
     await query.edit_message_text(
         f"Selected: {assessment['assessment_name']}\n"
         f"Maximum score: {assessment['max_score']}\n\n"
-        "Now upload a CSV or XLSX file with these exact column headers:\n"
-        "student_id, score\n\n"
-        "Example:\n"
-        "student_id,score\n"
-        "SB2024001,18\n"
-        "SB2024002,16.5"
+        "Now upload the original university grade sheet as CSV or XLSX.\n\n"
+        "Accepted headings include:\n"
+        "STUDENT ID NO | FULL NAME | GENDER | SECTION | Score\n\n"
+        "You may also use the simpler headings student_id and score.\n"
+        "Student ID and Score are required; extra columns are allowed."
     )
     return UPLOAD_FLOW + 2
 
@@ -979,7 +1039,13 @@ async def receive_grade_file(update, context):
             for row in parsed:
                 sid = row["student_id"]
                 if not sid:
-                    errors.append(f"Row {row['line']}: missing student_id")
+                    errors.append(f"Row {row['line']}: missing Student ID")
+                    continue
+                section = (row.get("section") or "").strip()
+                if section and section.casefold() not in {"b", "section b"}:
+                    errors.append(
+                        f"Row {row['line']}: section is '{section}', but this bot accepts Section B only"
+                    )
                     continue
                 if sid in seen:
                     errors.append(f"Row {row['line']}: duplicate Student ID {sid}")
@@ -991,7 +1057,7 @@ async def receive_grade_file(update, context):
                         raise InvalidOperation
                 except (InvalidOperation, ValueError):
                     errors.append(
-                        f"Row {row['line']}: invalid score for {sid}; "
+                        f"Row {row['line']}: missing or invalid score for {sid}; "
                         f"must be between 0 and {maximum}"
                     )
                     continue
