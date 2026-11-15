@@ -257,6 +257,7 @@ ADMIN_MENU = [
 INSTRUCTOR_MENU = [
     [KeyboardButton("My courses"), KeyboardButton("Create assessment")],
     [KeyboardButton("Upload grades"), KeyboardButton("Publish grades")],
+    [KeyboardButton("Edit Published Grades")],
     [KeyboardButton("Logout")]
 ]
 STUDENT_MENU = [
@@ -332,6 +333,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("flow", None)
     context.user_data.pop("upload_assessment_id", None)
+    context.user_data.pop("edit_published_mode", None)
+    context.user_data.pop("pending_published_edits", None)
     for key in (
         "bulk_roster", "bulk_preview", "bulk_file_name",
         "password_change_new", "password_change_old_hash",
@@ -1370,6 +1373,7 @@ async def reset_all_credentials_callback(update, context):
 
 ASSESSMENT_FLOW = 20
 UPLOAD_FLOW = 21
+UPLOAD_CONFIRM = 24
 
 
 def instructor_courses(instructor_id):
@@ -1647,6 +1651,8 @@ def parse_grade_file(filename, raw_bytes):
 
 
 async def upload_grades_start(update, context):
+    context.user_data.pop("edit_published_mode", None)
+    context.user_data.pop("pending_published_edits", None)
     session = require_role(update, context, ["instructor"])
     if not session:
         await update.message.reply_text("Only instructors can upload grades.")
@@ -1737,6 +1743,152 @@ async def upload_assessment_callback(update, context):
     return UPLOAD_FLOW + 2
 
 
+async def edit_published_grades_start(update, context):
+    session = require_role(update, context, ["instructor"])
+    if not session:
+        await update.message.reply_text("Only instructors can edit published grades.")
+        return ConversationHandler.END
+    courses = instructor_courses(session["id"])
+    if not courses:
+        await update.message.reply_text("You have no assigned courses.")
+        return ConversationHandler.END
+    context.user_data["edit_published_mode"] = True
+    buttons = [[InlineKeyboardButton(
+        f"{c['course_code']} — {c['course_name']}",
+        callback_data=f"editpubcourse:{c['id']}"
+    )] for c in courses]
+    await update.message.reply_text(
+        "Select the course containing the published grades you want to correct:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return UPLOAD_FLOW
+
+
+async def edit_published_course_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    session = require_role(update, context, ["instructor"])
+    if not session:
+        await query.edit_message_text("Please /login as an instructor.")
+        return ConversationHandler.END
+    course_id = int(query.data.split(":")[1])
+    allowed = {c["id"] for c in instructor_courses(session["id"])}
+    if course_id not in allowed:
+        await query.edit_message_text("You are not assigned to that course.")
+        return ConversationHandler.END
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT a.id, a.assessment_name, a.max_score, COUNT(r.id) AS published_count
+            FROM assessments a JOIN results r ON r.assessment_id=a.id
+            WHERE a.course_id=%s AND r.published=TRUE
+            GROUP BY a.id ORDER BY a.created_at DESC
+        """, (course_id,))
+        assessments = cur.fetchall()
+    if not assessments:
+        await query.edit_message_text("There are no published assessments to edit in this course.")
+        return ConversationHandler.END
+    context.user_data["upload_course_id"] = course_id
+    buttons = [[InlineKeyboardButton(
+        f"{a['assessment_name']} ({a['published_count']} published marks)",
+        callback_data=f"editpubassessment:{a['id']}"
+    )] for a in assessments]
+    await query.edit_message_text(
+        "Choose the published assessment to correct:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return UPLOAD_FLOW + 1
+
+
+async def edit_published_assessment_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    session = require_role(update, context, ["instructor"])
+    if not session:
+        await query.edit_message_text("Please /login as an instructor.")
+        return ConversationHandler.END
+    assessment_id = int(query.data.split(":")[1])
+    course_id = context.user_data.get("upload_course_id")
+    allowed = {c["id"] for c in instructor_courses(session["id"])}
+    if course_id not in allowed:
+        await query.edit_message_text("You are not assigned to that course.")
+        return ConversationHandler.END
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT a.id, a.assessment_name, a.max_score
+            FROM assessments a
+            WHERE a.id=%s AND a.course_id=%s
+              AND EXISTS (SELECT 1 FROM results r
+                          WHERE r.assessment_id=a.id AND r.published=TRUE)
+        """, (assessment_id, course_id))
+        assessment = cur.fetchone()
+    if not assessment:
+        await query.edit_message_text("This assessment is not published or does not belong to your course.")
+        return ConversationHandler.END
+    context.user_data["upload_assessment_id"] = assessment_id
+    context.user_data["upload_max_score"] = str(assessment["max_score"])
+    await query.edit_message_text(
+        f"Editing published assessment: {assessment['assessment_name']}\n"
+        f"Maximum score: {assessment['max_score']}\n\n"
+        "Upload the corrected CSV, XLS, XLSX or XLSM grade sheet.\n"
+        "Only student IDs included in the uploaded file will be changed."
+    )
+    return UPLOAD_FLOW + 2
+
+
+async def confirm_published_grade_edits(update, context):
+    query = update.callback_query
+    await query.answer()
+    session = require_role(update, context, ["instructor"])
+    if not session:
+        await query.edit_message_text("Please /login as an instructor.")
+        return ConversationHandler.END
+    if query.data == "editpub:no":
+        context.user_data.pop("pending_published_edits", None)
+        context.user_data.pop("edit_published_mode", None)
+        await query.edit_message_text("Correction cancelled. Published grades remain unchanged.")
+        return ConversationHandler.END
+    pending = context.user_data.get("pending_published_edits")
+    if not pending:
+        await query.edit_message_text("No pending correction was found. Please start again.")
+        return ConversationHandler.END
+    assessment_id = pending["assessment_id"]
+    course_id = pending["course_id"]
+    allowed = {c["id"] for c in instructor_courses(session["id"])}
+    if course_id not in allowed:
+        await query.edit_message_text("Authorization failed. No grades were changed.")
+        return ConversationHandler.END
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT id FROM assessments
+                WHERE id=%s AND course_id=%s
+                  AND EXISTS (SELECT 1 FROM results
+                              WHERE assessment_id=%s AND published=TRUE)
+                FOR UPDATE
+            """, (assessment_id, course_id, assessment_id))
+            if not cur.fetchone():
+                await query.edit_message_text("Assessment is no longer published. No grades were changed.")
+                return ConversationHandler.END
+            for student_db_id, score, sid in pending["clean"]:
+                cur.execute("""
+                    UPDATE results SET score=%s, published=FALSE, uploaded_at=NOW()
+                    WHERE student_id=%s AND assessment_id=%s AND published=TRUE
+                """, (score, student_db_id, assessment_id))
+        audit("instructor", session["id"],
+              f"Corrected {len(pending['clean'])} published marks for assessment {assessment_id}; reset to unpublished")
+        context.user_data.pop("pending_published_edits", None)
+        context.user_data.pop("edit_published_mode", None)
+        await query.edit_message_text(
+            f"{len(pending['clean'])} marks corrected successfully.\n"
+            "The corrected marks are now UNPUBLISHED and hidden from students. "
+            "Review them, then use Publish grades to make them visible again."
+        )
+    except Exception:
+        logger.exception("Published grade correction failed")
+        await query.edit_message_text("Correction failed. No partial changes should have been committed. Please try again.")
+    return ConversationHandler.END
+
+
 async def receive_grade_file(update, context):
     session = require_role(update, context, ["instructor"])
     assessment_id = context.user_data.get("upload_assessment_id")
@@ -1796,6 +1948,16 @@ async def receive_grade_file(update, context):
                 if not student:
                     errors.append(f"Row {row['line']}: unknown/inactive Student ID {sid}")
                     continue
+                if context.user_data.get("edit_published_mode"):
+                    cur.execute("""
+                        SELECT id FROM results
+                        WHERE student_id=%s AND assessment_id=%s AND published=TRUE
+                    """, (student["id"], assessment_id))
+                    if not cur.fetchone():
+                        errors.append(
+                            f"Row {row['line']}: {sid} has no currently published mark for this assessment"
+                        )
+                        continue
                 clean.append((student["id"], score, sid))
 
         if errors:
@@ -1809,6 +1971,25 @@ async def receive_grade_file(update, context):
         if not clean:
             await update.message.reply_text("No valid marks found. Nothing was saved.")
             return ConversationHandler.END
+
+        if context.user_data.get("edit_published_mode"):
+            context.user_data["pending_published_edits"] = {
+                "assessment_id": assessment_id,
+                "course_id": context.user_data.get("upload_course_id"),
+                "clean": clean,
+            }
+            preview = "\n".join(f"{sid}: {score}" for _, score, sid in clean[:15])
+            more = f"\n…and {len(clean)-15} more." if len(clean) > 15 else ""
+            await update.message.reply_text(
+                f"Correction preview: {len(clean)} student marks\n\n{preview}{more}\n\n"
+                "Confirm to replace these published marks. After confirmation, the corrected "
+                "marks will be hidden until you publish them again.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Confirm corrections", callback_data="editpub:yes"),
+                    InlineKeyboardButton("Cancel", callback_data="editpub:no")
+                ]])
+            )
+            return UPLOAD_CONFIRM
 
         with db_cursor() as cur:
             for student_db_id, score, sid in clean:
@@ -2059,6 +2240,8 @@ async def text_menu_router(update, context):
         await create_assessment_start(update, context)
     elif text_value == "Upload grades":
         await upload_grades_start(update, context)
+    elif text_value == "Edit Published Grades":
+        await edit_published_grades_start(update, context)
     elif text_value == "Publish grades":
         await publish_grades_start(update, context)
     elif text_value == "View my grades":
@@ -2182,6 +2365,18 @@ def build_application():
         allow_reentry=True
     )
 
+    edit_published_conversation = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Edit Published Grades$"), edit_published_grades_start)],
+        states={
+            UPLOAD_FLOW: [CallbackQueryHandler(edit_published_course_callback, pattern=r"^editpubcourse:\d+$")],
+            UPLOAD_FLOW + 1: [CallbackQueryHandler(edit_published_assessment_callback, pattern=r"^editpubassessment:\d+$")],
+            UPLOAD_FLOW + 2: [MessageHandler(filters.Document.ALL, receive_grade_file)],
+            UPLOAD_CONFIRM: [CallbackQueryHandler(confirm_published_grade_edits, pattern=r"^editpub:(yes|no)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("menu", menu_command))
@@ -2193,6 +2388,7 @@ def build_application():
     application.add_handler(reset_credentials_conversation)
     application.add_handler(assessment_conversation)
     application.add_handler(upload_conversation)
+    application.add_handler(edit_published_conversation)
 
     application.add_handler(CallbackQueryHandler(
         publish_course_callback, pattern=r"^pubcourse:\d+$"
@@ -2207,7 +2403,7 @@ def build_application():
     application.add_handler(MessageHandler(
         filters.Regex("^(My courses|View my grades|Publish grades|Logout|"
                       "Add student|Add instructor|Add course|Assign course|"
-                      "List courses|Create assessment|Upload grades)$"),
+                      "List courses|Create assessment|Upload grades|Edit Published Grades)$"),
         text_menu_router
     ))
 
