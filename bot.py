@@ -249,6 +249,7 @@ def require_role(update, context, roles):
 
 ADMIN_MENU = [
     [KeyboardButton("Add student"), KeyboardButton("Bulk Add Students")],
+    [KeyboardButton("Reset All Student Credentials")],
     [KeyboardButton("Add instructor"), KeyboardButton("Add course")],
     [KeyboardButton("Assign course"), KeyboardButton("List courses")],
     [KeyboardButton("Logout")]
@@ -260,6 +261,7 @@ INSTRUCTOR_MENU = [
 ]
 STUDENT_MENU = [
     [KeyboardButton("My courses"), KeyboardButton("View my grades")],
+    [KeyboardButton("Change Password")],
     [KeyboardButton("Logout")]
 ]
 
@@ -306,6 +308,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/login — Sign in\n"
         "/logout — Sign out\n"
         "/menu — Show your menu\n"
+        "Students can use Change Password from their menu to update their password.\n"
         "/cancel — Cancel the current operation\n\n"
         "Students use Student ID + password. Instructors use their username "
         "+ password. Grade files must contain student_id and score columns."
@@ -329,7 +332,11 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("flow", None)
     context.user_data.pop("upload_assessment_id", None)
-    for key in ("bulk_roster", "bulk_preview", "bulk_file_name"):
+    for key in (
+        "bulk_roster", "bulk_preview", "bulk_file_name",
+        "password_change_new", "password_change_old_hash",
+        "password_change_attempts"
+    ):
         context.user_data.pop(key, None)
     await update.message.reply_text("Operation cancelled.")
     await show_menu(update, context)
@@ -440,6 +447,156 @@ async def login_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_chat.send_message(
         f"Welcome, {record['full_name']}!",
         reply_markup=menu_for(role)
+    )
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Student self-service password change
+# ---------------------------------------------------------------------------
+
+CHANGE_PASSWORD_CURRENT, CHANGE_PASSWORD_NEW, CHANGE_PASSWORD_CONFIRM = range(53, 56)
+
+
+async def student_change_password_start(update, context):
+    session = require_role(update, context, ["student"])
+    if not session:
+        await update.effective_message.reply_text(
+            "Please log in with your student account before changing your password."
+        )
+        return ConversationHandler.END
+
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "For your security, change your password only in a private chat with this bot."
+        )
+        return ConversationHandler.END
+
+    context.user_data.pop("password_change_new", None)
+    context.user_data["password_change_attempts"] = 0
+    await update.effective_message.reply_text(
+        "Enter your current password. Your message will be deleted after it is received."
+    )
+    return CHANGE_PASSWORD_CURRENT
+
+
+async def student_change_password_current(update, context):
+    current_password = update.message.text
+    await safe_delete(update.message)
+    session = require_role(update, context, ["student"])
+    if not session:
+        context.user_data.pop("password_change_new", None)
+        return ConversationHandler.END
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT password_hash FROM students WHERE id=%s AND is_active=TRUE",
+                (session["id"],)
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.exception("Could not verify current student password")
+        await update.effective_chat.send_message(
+            "The database is temporarily unavailable. Please try again later."
+        )
+        return ConversationHandler.END
+
+    if not row or not verify_password(current_password, row["password_hash"]):
+        attempts = int(context.user_data.get("password_change_attempts", 0)) + 1
+        context.user_data["password_change_attempts"] = attempts
+        if attempts >= 3:
+            context.user_data.pop("password_change_attempts", None)
+            await update.effective_chat.send_message(
+                "Too many incorrect attempts. Password change cancelled."
+            )
+            return ConversationHandler.END
+        await update.effective_chat.send_message(
+            f"Current password is incorrect. {3 - attempts} attempt(s) remaining. Enter it again:"
+        )
+        return CHANGE_PASSWORD_CURRENT
+
+    context.user_data["password_change_old_hash"] = row["password_hash"]
+    await update.effective_chat.send_message(
+        f"Enter your new password (at least {MIN_PASSWORD_LENGTH} characters):"
+    )
+    return CHANGE_PASSWORD_NEW
+
+
+async def student_change_password_new(update, context):
+    new_password = update.message.text
+    await safe_delete(update.message)
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        await update.effective_chat.send_message(
+            f"Password is too short. Use at least {MIN_PASSWORD_LENGTH} characters. Enter a new password:"
+        )
+        return CHANGE_PASSWORD_NEW
+
+    old_hash = context.user_data.get("password_change_old_hash")
+    if old_hash and verify_password(new_password, old_hash):
+        await update.effective_chat.send_message(
+            "Your new password must be different from your current password. Enter another password:"
+        )
+        return CHANGE_PASSWORD_NEW
+
+    context.user_data["password_change_new"] = new_password
+    await update.effective_chat.send_message(
+        "Re-enter your new password to confirm it:"
+    )
+    return CHANGE_PASSWORD_CONFIRM
+
+
+async def student_change_password_confirm(update, context):
+    confirmation = update.message.text
+    await safe_delete(update.message)
+    new_password = context.user_data.get("password_change_new")
+    old_hash = context.user_data.get("password_change_old_hash")
+    session = require_role(update, context, ["student"])
+
+    if not session or not new_password or not old_hash:
+        context.user_data.pop("password_change_new", None)
+        context.user_data.pop("password_change_old_hash", None)
+        await update.effective_chat.send_message(
+            "Password change session expired. Please start again from the student menu."
+        )
+        return ConversationHandler.END
+
+    if not hmac.compare_digest(new_password, confirmation):
+        context.user_data.pop("password_change_new", None)
+        context.user_data.pop("password_change_old_hash", None)
+        await update.effective_chat.send_message(
+            "The passwords did not match. Nothing was changed. Select Change Password to try again."
+        )
+        return ConversationHandler.END
+
+    try:
+        new_hash = hash_password(new_password)
+        with db_cursor() as cur:
+            cur.execute("""
+                UPDATE students
+                SET password_hash=%s
+                WHERE id=%s AND is_active=TRUE AND password_hash=%s
+            """, (new_hash, session["id"], old_hash))
+            if cur.rowcount != 1:
+                raise RuntimeError("Student password changed concurrently or account is inactive.")
+            cur.execute("""
+                INSERT INTO audit_logs (actor_type, actor_id, action)
+                VALUES (%s, %s, %s)
+            """, ("student", session["id"], "Student changed their password"))
+    except Exception:
+        logger.exception("Student password change failed")
+        context.user_data.pop("password_change_new", None)
+        context.user_data.pop("password_change_old_hash", None)
+        await update.effective_chat.send_message(
+            "Password change failed. Your previous password should remain valid. Please try again later."
+        )
+        return ConversationHandler.END
+
+    context.user_data.pop("password_change_new", None)
+    context.user_data.pop("password_change_old_hash", None)
+    context.user_data.pop("password_change_attempts", None)
+    await update.effective_chat.send_message(
+        "Your password has been changed successfully. Use your new password the next time you log in."
     )
     return ConversationHandler.END
 
@@ -1030,6 +1187,178 @@ async def bulk_registration_callback(update, context):
         await query.edit_message_text(
             "Bulk registration could not be completed. Check the database/logs before retrying."
         )
+        return ConversationHandler.END
+    finally:
+        workbook_buffer.close()
+
+
+# ---------------------------------------------------------------------------
+# Reset all student credentials (Super Admin only)
+# ---------------------------------------------------------------------------
+
+RESET_CREDENTIALS_CONFIRM = 42
+
+
+async def reset_all_credentials_start(update, context):
+    """Ask for explicit confirmation before invalidating every student password."""
+    if not await admin_only(update, context):
+        return ConversationHandler.END
+
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM students")
+            total = int(cur.fetchone()["total"])
+    except Exception:
+        logger.exception("Could not count student accounts before credential reset")
+        await update.message.reply_text("Could not access student accounts. No passwords were changed.")
+        return ConversationHandler.END
+
+    if total == 0:
+        await update.message.reply_text("There are no student accounts to reset.")
+        return ConversationHandler.END
+
+    context.user_data["reset_credentials_expected_count"] = total
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("YES — Reset all passwords", callback_data="resetcreds:yes"),
+        InlineKeyboardButton("Cancel", callback_data="resetcreds:no")
+    ]])
+    await update.message.reply_text(
+        "⚠️ CONFIRM FULL STUDENT CREDENTIAL RESET\n\n"
+        f"Student accounts found: {total}\n\n"
+        "If you continue:\n"
+        "• Every existing student's password will be replaced.\n"
+        "• All old passwords will stop working.\n"
+        "• Student accounts, names, IDs, Telegram links and grades will remain unchanged.\n"
+        "• A new confidential Excel file with the new passwords will be generated.\n\n"
+        "This action cannot be undone. Continue?",
+        reply_markup=keyboard
+    )
+    return RESET_CREDENTIALS_CONFIRM
+
+
+async def reset_all_credentials_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not await admin_only(update, context):
+        await query.edit_message_text("This action is restricted to the Super Admin.")
+        return ConversationHandler.END
+
+    if query.data == "resetcreds:no":
+        context.user_data.pop("reset_credentials_expected_count", None)
+        await query.edit_message_text("Credential reset cancelled. No passwords were changed.")
+        return ConversationHandler.END
+
+    expected_count = context.user_data.pop("reset_credentials_expected_count", None)
+    credentials = []
+    workbook_buffer = io.BytesIO()
+    committed = False
+
+    try:
+        from openpyxl import Workbook
+
+        # Include active and inactive accounts; do not modify account status or grades.
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT id, student_id, full_name, is_active
+                FROM students
+                ORDER BY student_id
+            """)
+            students = cur.fetchall()
+
+        if not students:
+            await query.edit_message_text("No student accounts were found. Nothing was changed.")
+            return ConversationHandler.END
+
+        if expected_count is not None and len(students) != expected_count:
+            await query.edit_message_text(
+                "The number of student accounts changed after confirmation. "
+                "For safety, no passwords were changed. Please start again."
+            )
+            return ConversationHandler.END
+
+        for student in students:
+            temporary_password = secrets.token_urlsafe(12)
+            credentials.append({
+                "id": student["id"],
+                "student_id": student["student_id"],
+                "full_name": student["full_name"],
+                "is_active": student["is_active"],
+                "temporary_password": temporary_password,
+                "password_hash": hash_password(temporary_password)
+            })
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "New Student Credentials"
+        sheet.append(["STUDENT ID NO", "FULL NAME", "NEW TEMPORARY PASSWORD", "ACCOUNT STATUS"])
+        for item in credentials:
+            sheet.append([
+                item["student_id"], item["full_name"], item["temporary_password"],
+                "Active" if item["is_active"] else "Inactive"
+            ])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column, width in {"A": 20, "B": 34, "C": 30, "D": 16}.items():
+            sheet.column_dimensions[column].width = width
+        workbook.save(workbook_buffer)
+        workbook.close()
+        workbook_buffer.seek(0)
+
+        # Update all password hashes and write the audit event atomically.
+        with db_cursor() as cur:
+            for item in credentials:
+                cur.execute(
+                    "UPDATE students SET password_hash=%s WHERE id=%s",
+                    (item["password_hash"], item["id"])
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("A student account changed during the reset.")
+            cur.execute("""
+                INSERT INTO audit_logs (actor_type, actor_id, action)
+                VALUES (%s, %s, %s)
+            """, (
+                "admin", update.effective_user.id,
+                f"Reset credentials for all {len(credentials)} student accounts."
+            ))
+        committed = True
+
+        await query.edit_message_text(
+            f"Credential reset completed for {len(credentials)} student accounts."
+            + chr(10) * 2
+            + "All previous passwords are now invalid. The new credentials workbook follows."
+        )
+        workbook_buffer.seek(0)
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(
+                workbook_buffer,
+                filename="Section_B_NEW_Student_Credentials.xlsx"
+            ),
+            caption=(
+                "CONFIDENTIAL: New credentials for all registered student accounts. "
+                "Send each student only their own password. Do not post this workbook "
+                "in a group or public channel. Store it securely and delete it after distribution."
+            )
+        )
+        return ConversationHandler.END
+
+    except Exception:
+        logger.exception("Student credential reset operation failed")
+        if committed:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f"IMPORTANT: Passwords were reset for {len(credentials)} student accounts, "
+                    "but the Excel file could not be delivered. Old passwords no longer work. "
+                    "Do not repeat the reset blindly; contact the administrator for recovery."
+                )
+            )
+        else:
+            await query.edit_message_text(
+                "Credential reset failed before the database transaction was committed. "
+                "No passwords were changed. Check the server logs and try again."
+            )
         return ConversationHandler.END
     finally:
         workbook_buffer.close()
@@ -1786,6 +2115,35 @@ def build_application():
         allow_reentry=True
     )
 
+    student_password_conversation = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^Change Password$"), student_change_password_start)
+        ],
+        states={
+            CHANGE_PASSWORD_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_change_password_current)],
+            CHANGE_PASSWORD_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_change_password_new)],
+            CHANGE_PASSWORD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_change_password_confirm)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+
+    reset_credentials_conversation = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Regex("^Reset All Student Credentials$"),
+                reset_all_credentials_start
+            )
+        ],
+        states={
+            RESET_CREDENTIALS_CONFIRM: [CallbackQueryHandler(
+                reset_all_credentials_callback, pattern=r"^resetcreds:(yes|no)$"
+            )]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+
     assessment_conversation = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^Create assessment$"), create_assessment_start)
@@ -1831,6 +2189,8 @@ def build_application():
     application.add_handler(login_conversation)
     application.add_handler(admin_conversation)
     application.add_handler(bulk_student_conversation)
+    application.add_handler(student_password_conversation)
+    application.add_handler(reset_credentials_conversation)
     application.add_handler(assessment_conversation)
     application.add_handler(upload_conversation)
 
