@@ -12,7 +12,7 @@ Supported grade-file formats include the university sheet headings:
   STUDENT ID NO | FULL NAME | GENDER | SECTION | Score
 and simplified headings such as student_id, score.
 Student ID is authoritative; full name and gender are retained for reference.
-CSV and XLSX files are supported. Uploads are validated before database changes.
+CSV, XLS, XLSX and XLSM files are supported. Uploads are validated before database changes.
 """
 
 import os
@@ -44,6 +44,11 @@ try:
     from openpyxl import load_workbook
 except ImportError:
     load_workbook = None
+
+try:
+    import xlrd
+except ImportError:
+    xlrd = None
 
 
 # ---------------------------------------------------------------------------
@@ -911,8 +916,36 @@ def parse_grade_file(filename, raw_bytes):
                 })
         finally:
             workbook.close()
+
+    elif extension == "xls":
+        if xlrd is None:
+            raise ValueError("Legacy Excel .xls support is not installed. Add xlrd to requirements.txt.")
+        try:
+            workbook = xlrd.open_workbook(file_contents=raw_bytes)
+            sheet = workbook.sheet_by_index(0)
+        except Exception as exc:
+            raise ValueError("Could not read this .xls file. Make sure it is a valid Excel 97-2003 workbook.") from exc
+        if sheet.nrows < 1:
+            raise ValueError("Excel file is empty.")
+        headers = sheet.row_values(0)
+        indexes = _grade_column_indexes(headers)
+        for row_index in range(1, sheet.nrows):
+            values = sheet.row_values(row_index)
+            if not any(_cell_text(value) for value in values):
+                continue
+            def get_value(field):
+                index = indexes.get(field)
+                return _cell_text(values[index]) if index is not None and index < len(values) else ""
+            rows.append({
+                "line": row_index + 1,
+                "student_id": get_value("student_id"),
+                "full_name": get_value("full_name"),
+                "gender": get_value("gender"),
+                "section": get_value("section"),
+                "score": get_value("score")
+            })
     else:
-        raise ValueError("Upload a .csv or .xlsx file.")
+        raise ValueError("Upload a .csv, .xls, .xlsx or .xlsm file.")
 
     if not rows:
         raise ValueError("No grade rows were found below the header row.")
@@ -1001,7 +1034,7 @@ async def upload_assessment_callback(update, context):
     await query.edit_message_text(
         f"Selected: {assessment['assessment_name']}\n"
         f"Maximum score: {assessment['max_score']}\n\n"
-        "Now upload the original university grade sheet as CSV or XLSX.\n\n"
+        "Now upload the original university grade sheet as CSV, XLS or XLSX.\n\n"
         "Accepted headings include:\n"
         "STUDENT ID NO | FULL NAME | GENDER | SECTION | Score\n\n"
         "You may also use the simpler headings student_id and score.\n"
