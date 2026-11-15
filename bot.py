@@ -32,7 +32,7 @@ from psycopg2.extras import RealDictCursor
 from flask import Flask
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -248,9 +248,10 @@ def require_role(update, context, roles):
 # ---------------------------------------------------------------------------
 
 ADMIN_MENU = [
-    [KeyboardButton("Add student"), KeyboardButton("Add instructor")],
-    [KeyboardButton("Add course"), KeyboardButton("Assign course")],
-    [KeyboardButton("List courses"), KeyboardButton("Logout")]
+    [KeyboardButton("Add student"), KeyboardButton("Bulk Add Students")],
+    [KeyboardButton("Add instructor"), KeyboardButton("Add course")],
+    [KeyboardButton("Assign course"), KeyboardButton("List courses")],
+    [KeyboardButton("Logout")]
 ]
 INSTRUCTOR_MENU = [
     [KeyboardButton("My courses"), KeyboardButton("Create assessment")],
@@ -328,6 +329,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("flow", None)
     context.user_data.pop("upload_assessment_id", None)
+    for key in ("bulk_roster", "bulk_preview", "bulk_file_name"):
+        context.user_data.pop(key, None)
     await update.message.reply_text("Operation cancelled.")
     await show_menu(update, context)
     return ConversationHandler.END
@@ -668,6 +671,368 @@ async def list_courses(update, context):
         for r in rows
     ]
     await update.message.reply_text("Section B courses:\n\n" + "\n".join(lines))
+
+
+
+# ---------------------------------------------------------------------------
+# Bulk student registration (Super Admin only)
+# ---------------------------------------------------------------------------
+
+BULK_UPLOAD = 40
+BULK_CONFIRM = 41
+MAX_ROSTER_BYTES = 8 * 1024 * 1024
+MAX_ROSTER_ROWS = 500
+
+
+def _roster_column_indexes(headers):
+    aliases = {
+        "student_id": {
+            "studentidno", "studentidnumber", "studentid", "studentno",
+            "studentnumber", "idno", "idnumber", "studentcode"
+        },
+        "full_name": {"fullname", "studentname", "name"},
+        "gender": {"gender", "sex"},
+        "section": {"section", "classsection", "group"}
+    }
+    indexes = {}
+    for index, heading in enumerate(headers):
+        normalized = _normalize_grade_header(heading)
+        for field, accepted in aliases.items():
+            if normalized in accepted and field not in indexes:
+                indexes[field] = index
+    if "student_id" not in indexes or "full_name" not in indexes:
+        raise ValueError(
+            "Required columns not found. Include 'STUDENT ID NO' and 'FULL NAME'."
+        )
+    return indexes
+
+
+def parse_student_roster_file(filename, raw_bytes):
+    """Parse a Section B roster. Gender and other extra columns are optional."""
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    rows = []
+
+    def append_rows(headers, data_rows, first_line=2):
+        indexes = _roster_column_indexes(headers)
+        for line_number, values in enumerate(data_rows, start=first_line):
+            if not any(_cell_text(value) for value in values):
+                continue
+            def get_value(field):
+                index = indexes.get(field)
+                return _cell_text(values[index]) if index is not None and index < len(values) else ""
+            rows.append({
+                "line": line_number,
+                "student_id": get_value("student_id"),
+                "full_name": get_value("full_name"),
+                "gender": get_value("gender"),
+                "section": get_value("section")
+            })
+            if len(rows) > MAX_ROSTER_ROWS:
+                raise ValueError(f"Roster exceeds the {MAX_ROSTER_ROWS}-student limit.")
+
+    if extension == "csv":
+        decoded = None
+        for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+            try:
+                decoded = raw_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                pass
+        if decoded is None:
+            raise ValueError("CSV encoding is unsupported. Save as UTF-8 CSV.")
+        reader = csv.reader(io.StringIO(decoded))
+        headers = next(reader, None)
+        if not headers:
+            raise ValueError("CSV file is empty.")
+        append_rows(headers, reader)
+    elif extension in ("xlsx", "xlsm"):
+        if load_workbook is None:
+            raise ValueError("Excel support is unavailable. Install openpyxl.")
+        workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        try:
+            iterator = workbook.active.iter_rows(values_only=True)
+            headers = next(iterator, None)
+            if not headers:
+                raise ValueError("Excel file is empty.")
+            append_rows(headers, iterator)
+        finally:
+            workbook.close()
+    elif extension == "xls":
+        if xlrd is None:
+            raise ValueError("Legacy .xls support is unavailable. Install xlrd.")
+        try:
+            workbook = xlrd.open_workbook(file_contents=raw_bytes)
+            sheet = workbook.sheet_by_index(0)
+        except Exception as exc:
+            raise ValueError("Could not read this .xls workbook.") from exc
+        if sheet.nrows < 1:
+            raise ValueError("Excel file is empty.")
+        append_rows(sheet.row_values(0),
+                    (sheet.row_values(i) for i in range(1, sheet.nrows)))
+    else:
+        raise ValueError("Upload a .csv, .xls, .xlsx or .xlsm roster.")
+
+    if not rows:
+        raise ValueError("No student records were found below the header row.")
+    return rows
+
+
+async def bulk_add_students_start(update, context):
+    if not await admin_only(update, context):
+        return ConversationHandler.END
+    context.user_data.pop("bulk_roster", None)
+    context.user_data.pop("bulk_preview", None)
+    await update.message.reply_text(
+        "Upload the Section B student roster as an Excel or CSV document.\n\n"
+        "Required columns: STUDENT ID NO and FULL NAME.\n"
+        "Optional columns: GENDER and SECTION. Extra columns such as No are ignored.\n"
+        "Only Section B records are accepted. Maximum file size: 8 MB; maximum 500 students.\n\n"
+        "No accounts will be created until you confirm the preview. Send /cancel to stop."
+    )
+    return BULK_UPLOAD
+
+
+async def receive_student_roster(update, context):
+    if not await admin_only(update, context):
+        return ConversationHandler.END
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("Please upload the roster as a document.")
+        return BULK_UPLOAD
+    if document.file_size and document.file_size > MAX_ROSTER_BYTES:
+        await update.message.reply_text("File too large. Maximum supported size is 8 MB.")
+        return BULK_UPLOAD
+
+    filename = document.file_name or "roster.xlsx"
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        raw_bytes = bytes(await tg_file.download_as_bytearray())
+        parsed = parse_student_roster_file(filename, raw_bytes)
+
+        seen = set()
+        valid = []
+        errors = []
+        for row in parsed:
+            sid = row["student_id"].strip()
+            name = row["full_name"].strip()
+            section = row["section"].strip()
+            if not sid:
+                errors.append(f"Row {row['line']}: missing Student ID.")
+                continue
+            if not name:
+                errors.append(f"Row {row['line']}: missing full name ({sid}).")
+                continue
+            if section and section.casefold() not in {"b", "section b"}:
+                errors.append(f"Row {row['line']}: section '{section}' is not Section B.")
+                continue
+            if sid in seen:
+                errors.append(f"Row {row['line']}: duplicate Student ID inside this file ({sid}).")
+                continue
+            seen.add(sid)
+            valid.append({
+                "student_id": sid,
+                "full_name": name,
+                "gender": row["gender"],
+                "section": section or "B",
+                "line": row["line"]
+            })
+
+        if errors:
+            details = "\n".join(errors[:20])
+            if len(errors) > 20:
+                details += f"\n…and {len(errors) - 20} more."
+            await update.message.reply_text(
+                "Roster rejected. Correct these issues and upload again:\n\n" + details
+            )
+            return BULK_UPLOAD
+
+        ids = [row["student_id"] for row in valid]
+        with db_cursor() as cur:
+            cur.execute("SELECT student_id FROM students WHERE student_id = ANY(%s)", (ids,))
+            existing = {row["student_id"] for row in cur.fetchall()}
+
+        new_students = [row for row in valid if row["student_id"] not in existing]
+        already_registered = len(valid) - len(new_students)
+        if not new_students:
+            await update.message.reply_text(
+                f"All {already_registered} valid records already exist. No new accounts are needed."
+            )
+            return ConversationHandler.END
+
+        context.user_data["bulk_roster"] = new_students
+        context.user_data["bulk_file_name"] = filename
+        context.user_data["bulk_preview"] = {
+            "total": len(valid),
+            "existing": already_registered,
+            "new": len(new_students)
+        }
+        preview_lines = [
+            f"• {row['student_id']} — {row['full_name']}"
+            for row in new_students[:12]
+        ]
+        if len(new_students) > 12:
+            preview_lines.append(f"…and {len(new_students) - 12} more new students.")
+        summary = (
+            "ROSTER VALIDATION COMPLETE\n\n"
+            f"Total valid records: {len(valid)}\n"
+            f"Already registered (will be skipped): {already_registered}\n"
+            f"New accounts to create: {len(new_students)}\n\n"
+            "New students:\n" + "\n".join(preview_lines) +
+            "\n\nEach new student will receive a unique temporary password. "
+            "A separate Excel credentials file will be sent to you after registration.\n\n"
+            "Create these accounts?"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Confirm registration", callback_data="bulkconfirm:yes"),
+            InlineKeyboardButton("Cancel", callback_data="bulkconfirm:no")
+        ]])
+        await update.message.reply_text(summary, reply_markup=keyboard)
+        return BULK_CONFIRM
+    except ValueError as exc:
+        await update.message.reply_text(f"Could not process roster: {exc}")
+        return BULK_UPLOAD
+    except Exception:
+        logger.exception("Bulk roster validation failed")
+        await update.message.reply_text("Roster validation failed. No accounts were created.")
+        return BULK_UPLOAD
+
+
+async def bulk_registration_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not await admin_only(update, context):
+        await query.edit_message_text("This action is restricted to the Super Admin.")
+        return ConversationHandler.END
+
+    if query.data == "bulkconfirm:no":
+        context.user_data.pop("bulk_roster", None)
+        context.user_data.pop("bulk_preview", None)
+        context.user_data.pop("bulk_file_name", None)
+        await query.edit_message_text("Bulk registration cancelled. No accounts were created.")
+        return ConversationHandler.END
+
+    roster = context.user_data.get("bulk_roster")
+    if not roster:
+        await query.edit_message_text("The roster session expired. Upload the file again.")
+        return ConversationHandler.END
+
+    # Generate credentials and workbook before committing, so the workbook is ready
+    # if the database transaction succeeds.
+    credentials = []
+    workbook_buffer = io.BytesIO()
+    try:
+        from openpyxl import Workbook
+        for row in roster:
+            temporary_password = secrets.token_urlsafe(12)
+            credentials.append({
+                **row,
+                "temporary_password": temporary_password,
+                "password_hash": hash_password(temporary_password)
+            })
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Student Credentials"
+        sheet.append(["STUDENT ID NO", "FULL NAME", "TEMPORARY PASSWORD", "SECTION"])
+        for item in credentials:
+            sheet.append([
+                item["student_id"], item["full_name"],
+                item["temporary_password"], item["section"]
+            ])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        workbook.save(workbook_buffer)
+        workbook.close()
+        workbook_buffer.seek(0)
+
+        inserted = 0
+        with db_cursor() as cur:
+            for item in credentials:
+                cur.execute("""
+                    INSERT INTO students (student_id, full_name, password_hash)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (student_id) DO NOTHING
+                    RETURNING id
+                """, (item["student_id"], item["full_name"], item["password_hash"]))
+                if cur.fetchone():
+                    inserted += 1
+            cur.execute("""
+                INSERT INTO audit_logs (actor_type, actor_id, action)
+                VALUES (%s, %s, %s)
+            """, (
+                "admin", update.effective_user.id,
+                f"Bulk student registration: {inserted} accounts created; "
+                f"{len(roster) - inserted} skipped due to concurrent/existing records."
+            ))
+
+        # Credentials are sent only for accounts actually inserted.
+        # In a rare concurrent-registration race, discard skipped passwords.
+        inserted_ids = {item["student_id"] for item in credentials}
+        if inserted != len(credentials):
+            # Re-query the IDs is not sufficient to identify which insert raced;
+            # use a second safe query and include only accounts whose stored hash
+            # matches this batch's generated hash.
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT student_id, password_hash FROM students WHERE student_id = ANY(%s)",
+                    ([item["student_id"] for item in credentials],)
+                )
+                stored = {r["student_id"]: r["password_hash"] for r in cur.fetchall()}
+            credentials = [
+                item for item in credentials
+                if stored.get(item["student_id"]) == item["password_hash"]
+            ]
+            workbook_buffer = io.BytesIO()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Student Credentials"
+            sheet.append(["STUDENT ID NO", "FULL NAME", "TEMPORARY PASSWORD", "SECTION"])
+            for item in credentials:
+                sheet.append([
+                    item["student_id"], item["full_name"],
+                    item["temporary_password"], item["section"]
+                ])
+            workbook.save(workbook_buffer)
+            workbook.close()
+            workbook_buffer.seek(0)
+
+        context.user_data.pop("bulk_roster", None)
+        context.user_data.pop("bulk_preview", None)
+        context.user_data.pop("bulk_file_name", None)
+
+        await query.edit_message_text(
+            f"Registration completed: {inserted} new student accounts created.\n"
+            f"{len(roster) - inserted} records were skipped because they already existed.\n\n"
+            "I will now send the credentials workbook. Distribute each password privately "
+            "and delete the workbook after secure delivery."
+        )
+        if inserted:
+            workbook_buffer.seek(0)
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(
+                    workbook_buffer,
+                    filename="Section_B_Student_Credentials.xlsx"
+                ),
+                caption=(
+                    "Confidential student credentials. Send each student only their own "
+                    "password. Do not share this file in the group."
+                )
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="No new accounts were created; no credentials file is needed."
+            )
+        return ConversationHandler.END
+    except Exception:
+        logger.exception("Bulk student registration failed")
+        await query.edit_message_text(
+            "Bulk registration could not be completed. Check the database/logs before retrying."
+        )
+        return ConversationHandler.END
+    finally:
+        workbook_buffer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1772,20 @@ def build_application():
         allow_reentry=True
     )
 
+    bulk_student_conversation = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^Bulk Add Students$"), bulk_add_students_start)
+        ],
+        states={
+            BULK_UPLOAD: [MessageHandler(filters.Document.ALL, receive_student_roster)],
+            BULK_CONFIRM: [CallbackQueryHandler(
+                bulk_registration_callback, pattern=r"^bulkconfirm:(yes|no)$"
+            )]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+
     assessment_conversation = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^Create assessment$"), create_assessment_start)
@@ -1451,6 +1830,7 @@ def build_application():
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(login_conversation)
     application.add_handler(admin_conversation)
+    application.add_handler(bulk_student_conversation)
     application.add_handler(assessment_conversation)
     application.add_handler(upload_conversation)
 
